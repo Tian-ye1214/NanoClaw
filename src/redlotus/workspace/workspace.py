@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import json
+import hashlib
 from dataclasses import dataclass
 from datetime import datetime, timezone
 from pathlib import Path
@@ -16,6 +17,11 @@ _workspace: Path | None = None
 
 
 def current_workspace() -> Path:
+    from redlotus.runtime.context import active_workspace
+
+    active = active_workspace()
+    if active is not None:
+        return active.root
     if _workspace is not None:
         return _workspace
     return Path.cwd().resolve()
@@ -39,10 +45,11 @@ def snapshot_basename(
     *,
     sub_id: str | None = None,
 ) -> str:
-    parts = [safe_segment(role, 40), safe_segment(date, 16), safe_segment(topic, 80)]
-    if sub_id:
-        parts.append(safe_segment(sub_id, 60))
-    return "_".join(parts)
+    # Full titles belong in metadata; short filenames also work in deep Windows projects.
+    identity = hashlib.sha256(
+        f"{role}\0{date}\0{topic}\0{sub_id or ''}".encode()
+    ).hexdigest()[:16]
+    return f"{safe_segment(role, 12)}_{safe_segment(date, 8)}_{identity}"
 
 
 def snapshot_base_from_loadable(path: Path) -> Path:
@@ -51,10 +58,6 @@ def snapshot_base_from_loadable(path: Path) -> Path:
         raise ValueError(f"not a loadable snapshot: {path}")
     stem = name[: -len(MODEL_MESSAGES_SUFFIX)]
     return Path(path).parent / stem
-
-
-def stm_log_key(path: Path) -> str:
-    return Path(path).resolve().as_posix()
 
 
 def _parse_saved_at(value: Any, *, fallback_path: Path) -> datetime:

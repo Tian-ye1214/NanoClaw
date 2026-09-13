@@ -6,7 +6,8 @@ from decimal import Decimal
 from pathlib import Path
 from typing import Any, Callable, Iterable
 
-from pydantic_ai.messages import ModelMessagesTypeAdapter, ModelResponse
+from pydantic_ai.messages import ModelResponse, ModelMessagesTypeAdapter
+from redlotus.tools.conversation_log import read_saved_model_messages_file
 
 
 MODEL_MESSAGES_GLOB = "*_ModelMessages.json"
@@ -37,7 +38,9 @@ class PriceEstimate:
 
     def add(self, billable: BillableTokens) -> None:
         input_cost = Decimal(billable.prompt_tokens) * self.prompt_usd_per_token
-        output_cost = Decimal(billable.completion_tokens) * self.completion_usd_per_token
+        output_cost = (
+            Decimal(billable.completion_tokens) * self.completion_usd_per_token
+        )
         self.input_usd += input_cost
         self.output_usd += output_cost
         self.total_usd += input_cost + output_cost
@@ -54,14 +57,14 @@ class UsageTotals:
     completion_billable_tokens: int = 0
 
     def add_usage(self, usage: Any, billable: BillableTokens) -> None:
-        self.input_tokens += _int_attr(usage, "input_tokens")
-        self.output_tokens += _int_attr(usage, "output_tokens")
-        self.reasoning_tokens += _detail_int(usage, "reasoning_tokens")
+        self.input_tokens += usage.input_tokens
+        self.output_tokens += usage.output_tokens
+        self.reasoning_tokens += usage.details.get("reasoning_tokens", 0)
         self.prompt_billable_tokens += billable.prompt_tokens
         self.completion_billable_tokens += billable.completion_tokens
 
     def add_totals(self, other: "UsageTotals") -> None:
-        for name in self.__dataclass_fields__:
+        for name in UsageTotals.__dataclass_fields__:
             setattr(self, name, getattr(self, name) + getattr(other, name))
 
 
@@ -113,50 +116,12 @@ class UsageReport:
 PriceResolver = Callable[[str], ResolvedTokenPrice | None]
 
 
-def _int_attr(obj: Any, attr: str) -> int:
-    value = getattr(obj, attr, 0)
-    return value if isinstance(value, int) and value > 0 else 0
-
-
-def _detail_int(usage: Any, key: str) -> int:
-    details = getattr(usage, "details", None)
-    if not isinstance(details, dict):
-        return 0
-    value = details.get(key)
-    return value if isinstance(value, int) and value > 0 else 0
-
-
-def _usage_has_values(usage: Any) -> bool:
-    if usage is None:
-        return False
-    has_values = getattr(usage, "has_values", None)
-    if callable(has_values):
-        return bool(has_values())
-    attrs = (
-        "input_tokens",
-        "cache_write_tokens",
-        "cache_read_tokens",
-        "output_tokens",
-        "input_audio_tokens",
-        "cache_audio_read_tokens",
-        "output_audio_tokens",
-    )
-    return any(_int_attr(usage, attr) for attr in attrs) or any(
-        _detail_int(usage, key)
-        for key in (
-            "prompt_cache_hit_tokens",
-            "prompt_cache_miss_tokens",
-            "reasoning_tokens",
-        )
-    )
-
-
 def billable_tokens_from_usage(usage: Any) -> BillableTokens:
-    prompt_cache_total = _detail_int(usage, "prompt_cache_hit_tokens") + _detail_int(
-        usage, "prompt_cache_miss_tokens"
-    )
-    prompt_tokens = max(_int_attr(usage, "input_tokens"), prompt_cache_total)
-    completion_tokens = _int_attr(usage, "output_tokens")
+    prompt_cache_total = usage.details.get(
+        "prompt_cache_hit_tokens", 0
+    ) + usage.details.get("prompt_cache_miss_tokens", 0)
+    prompt_tokens = max(usage.input_tokens, prompt_cache_total)
+    completion_tokens = usage.output_tokens
 
     return BillableTokens(
         prompt_tokens=prompt_tokens,
@@ -164,16 +129,24 @@ def billable_tokens_from_usage(usage: Any) -> BillableTokens:
     )
 
 
-def read_model_messages_file(path: Path) -> tuple[list[Any], dict[str, Any]]:
-    with Path(path).open(encoding="utf-8") as f:
-        data = json.load(f)
-    raw = data.get("model_messages")
-    if not isinstance(raw, list):
-        raise ValueError(f"invalid model_messages file: {path}")
-    meta_raw = data.get("meta")
-    meta = dict(meta_raw) if isinstance(meta_raw, dict) else {}
-    meta["saved_at"] = data.get("saved_at")
-    return ModelMessagesTypeAdapter.validate_python(raw), meta
+def read_usage_messages(path: Path):
+    """Count original requests even after compaction, once per provider response."""
+    messages, meta = read_saved_model_messages_file(path)
+    journal = path.with_name(path.name.replace("_ModelMessages.json", ".jsonl"))
+    if journal == path or not journal.is_file():
+        return messages, meta
+    responses = {}
+    for line in journal.read_text(encoding="utf-8").splitlines():
+        raw = json.loads(line)["message"]
+        if raw["kind"] != "response":
+            continue
+        response = ModelMessagesTypeAdapter.validate_python([raw])[0]
+        identity = response.provider_response_id or (
+            response.run_id,
+            response.timestamp,
+        )
+        responses[identity] = response
+    return list(responses.values()), meta
 
 
 def model_message_files_for_path(path: Path) -> list[Path]:
@@ -185,7 +158,9 @@ def model_message_files_for_path(path: Path) -> list[Path]:
     return []
 
 
-def session_model_message_files(conversations_root_path: Path, session_key: str) -> list[Path]:
+def session_model_message_files(
+    conversations_root_path: Path, session_key: str
+) -> list[Path]:
     parts = str(session_key or "").split("/", 1)
     if len(parts) != 2 or not parts[0] or not parts[1]:
         return []
@@ -202,7 +177,10 @@ def session_model_message_files(conversations_root_path: Path, session_key: str)
             continue
         meta_raw = data.get("meta")
         meta = dict(meta_raw) if isinstance(meta_raw, dict) else {}
-        if str(meta.get("date") or "") == date and str(meta.get("topic") or "") == topic:
+        if (
+            str(meta.get("date") or "") == date
+            and str(meta.get("topic") or "") == topic
+        ):
             out.append(fp)
     return sorted(out, key=lambda item: str(item))
 
@@ -210,9 +188,9 @@ def session_model_message_files(conversations_root_path: Path, session_key: str)
 def latest_usage_input_tokens(messages: Iterable[Any]) -> int | None:
     for message in reversed(list(messages)):
         if isinstance(message, ModelResponse):
-            usage = getattr(message, "usage", None)
-            if _usage_has_values(usage):
-                return _int_attr(usage, "input_tokens")
+            usage = message.usage
+            if usage.has_values():
+                return usage.input_tokens
     return None
 
 
@@ -224,13 +202,18 @@ def summarize_messages(
     price_resolver: PriceResolver | None = None,
 ) -> UsageFileSummary:
     resolver = price_resolver or resolve_token_price
-    summary = UsageFileSummary(path=Path(path) if path is not None else Path(), meta=meta or {})
+    summary = UsageFileSummary(
+        path=Path(path) if path is not None else Path(), meta=meta or {}
+    )
     for message in messages:
-        if not isinstance(message, ModelResponse):
+        if (
+            not isinstance(message, ModelResponse)
+            or (message.metadata or {}).get("origin") == "execution_status"
+        ):
             continue
         summary.totals.responses += 1
-        usage = getattr(message, "usage", None)
-        if not _usage_has_values(usage):
+        usage = message.usage
+        if not usage.has_values():
             summary.totals.missing_usage_responses += 1
             continue
         model_name = str(getattr(message, "model_name", "") or "unknown")
@@ -243,99 +226,31 @@ def summarize_messages(
     return summary
 
 
-def summarize_usage_files(
-    paths: Iterable[Path],
-    *,
-    price_resolver: PriceResolver | None = None,
-) -> UsageReport:
-    report = UsageReport()
+def summarize_usage_files(paths: Iterable[Path], *, price_resolver=None) -> UsageReport:
+    files, messages = [], []
     for path in paths:
-        messages, meta = read_model_messages_file(Path(path))
-        file_summary = summarize_messages(
-            messages,
-            meta=meta,
-            path=Path(path),
-            price_resolver=price_resolver,
-        )
-        report.files.append(file_summary)
-        report.totals.add_totals(file_summary.totals)
-        for model_name, model_summary in file_summary.by_model.items():
-            total_model = report.by_model.setdefault(
-                model_name, ModelUsageSummary(model_name=model_name)
+        batch, meta = read_usage_messages(Path(path))
+        files.append(
+            summarize_messages(
+                batch, meta=meta, path=path, price_resolver=price_resolver
             )
-            total_model.totals.add_totals(model_summary.totals)
-            total_model.price_unavailable_responses += model_summary.price_unavailable_responses
-            if model_summary.price is not None:
-                if total_model.price is None:
-                    total_model.price = PriceEstimate(
-                        prompt_usd_per_token=model_summary.price.prompt_usd_per_token,
-                        completion_usd_per_token=model_summary.price.completion_usd_per_token,
-                        source=model_summary.price.source,
-                        input_usd=model_summary.price.input_usd,
-                        output_usd=model_summary.price.output_usd,
-                        total_usd=model_summary.price.total_usd,
-                    )
-                else:
-                    total_model.price.input_usd += model_summary.price.input_usd
-                    total_model.price.output_usd += model_summary.price.output_usd
-                    total_model.price.total_usd += model_summary.price.total_usd
-                    if total_model.price.source != model_summary.price.source:
-                        sources = sorted({total_model.price.source, model_summary.price.source})
-                        total_model.price.source = ", ".join(sources)
-    return report
+        )
+        messages.extend(batch)
+    total = summarize_messages(messages, price_resolver=price_resolver)
+    return UsageReport(files=files, totals=total.totals, by_model=total.by_model)
 
 
 def resolve_token_price(model_name: str) -> ResolvedTokenPrice | None:
-    candidates = _openrouter_price_candidates(model_name)
-    prompt = _max_price(candidates, "prompt")
-    completion = _max_price(candidates, "completion")
-    if prompt is None or completion is None:
-        return None
-    source = ", ".join(sorted({prompt[1], completion[1]}))
-    return ResolvedTokenPrice(
-        model_name=model_name,
-        prompt_usd_per_token=prompt[0],
-        completion_usd_per_token=completion[0],
-        source=source,
-    )
-
-
-def _max_price(
-    candidates: list[tuple[Decimal | None, Decimal | None, str]],
-    kind: str,
-) -> tuple[Decimal, str] | None:
-    index = 0 if kind == "prompt" else 1
-    values: list[tuple[Decimal, str]] = []
-    for candidate in candidates:
-        value = candidate[index]
-        if value is not None:
-            values.append((value, candidate[2]))
-    if not values:
-        return None
-    return max(values, key=lambda item: item[0])
-
-
-def _openrouter_price_candidates(model_name: str) -> list[tuple[Decimal | None, Decimal | None, str]]:
     from redlotus.ModelGateway.ModelChecker import _lookup_openrouter_meta
+    from decimal import InvalidOperation
 
+    pricing = (_lookup_openrouter_meta(model_name) or {}).get("pricing") or {}
     try:
-        meta = _lookup_openrouter_meta(model_name)
-    except Exception:
-        meta = None
-    pricing = meta.get("pricing") if isinstance(meta, dict) else None
-    if not isinstance(pricing, dict):
-        return []
-    prompt = _decimal_or_none(pricing.get("prompt"))
-    completion = _decimal_or_none(pricing.get("completion"))
-    if prompt is None and completion is None:
-        return []
-    return [(prompt, completion, "openrouter")]
-
-
-def _decimal_or_none(value: Any) -> Decimal | None:
-    if value is None:
-        return None
-    try:
-        return Decimal(str(value))
-    except Exception:
+        return ResolvedTokenPrice(
+            model_name,
+            Decimal(str(pricing["prompt"])),
+            Decimal(str(pricing["completion"])),
+            "openrouter",
+        )
+    except (KeyError, InvalidOperation):
         return None

@@ -1,15 +1,20 @@
-import os
-import sys
+"""Source-checkout launcher; importing this module performs no application startup."""
 
-if getattr(sys, "frozen", False):
-    os.environ["LOGFIRE_PYDANTIC_RECORD"] = "off"
 
-_root = os.path.dirname(os.path.abspath(__file__))
-_src = os.path.join(_root, "src")
-if _src not in sys.path:
-    sys.path.insert(0, _src)
+def main():
+    import os
+    import sys
+    from pathlib import Path
 
-from redlotus.agent_core.entrypoint import main
+    if getattr(sys, "frozen", False):
+        os.environ["LOGFIRE_PYDANTIC_RECORD"] = "off"
+    source = str(Path(__file__).resolve().parent / "src")
+    if source not in sys.path:
+        sys.path.insert(0, source)
+    from redlotus.agent_core.entrypoint import main as run
+
+    run()
+
 
 if __name__ == "__main__":
     main()

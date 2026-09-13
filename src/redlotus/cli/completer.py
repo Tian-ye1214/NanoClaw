@@ -3,17 +3,13 @@
 from __future__ import annotations
 
 from pathlib import Path
+import os
+from redlotus.workspace.workspace import current_workspace
 
 from prompt_toolkit.completion import Completer, Completion
 
-from redlotus.cli.completion import (
-    completion_for_input,
-    iter_agent_role_completions,
-    iter_command_completions,
-    iter_effort_value_completions,
-    iter_literal_choice_completions,
-)
-from redlotus.infra.path_sandbox import runtime_repo_root
+from redlotus.cli.completion import completion_for_input, COMMANDS, EFFORT_VALUES
+from redlotus.config.app_config import get_agent_roles, role_supported_thinking_efforts
 
 _COMPLETION_LIMIT = 50
 
@@ -22,76 +18,76 @@ class AgentCompleter(Completer):
     """根据光标前上下文补全命令、角色名或文件路径。"""
 
     def get_completions(self, document, complete_event):
-        text = document.text_before_cursor
-        ctx = completion_for_input(text)
-        if ctx is None:
-            return
+        yield from input_completions(document.text_before_cursor)
 
-        if ctx.kind == "command":
-            word = document.get_word_before_cursor(WORD=True)
-            for cmd in iter_command_completions(word):
-                yield Completion(cmd, start_position=-len(word), display_meta="command")
-            return
 
-        if ctx.kind == "agent_role":
-            for role in iter_agent_role_completions(ctx.prefix):
-                yield Completion(role, start_position=-len(ctx.prefix), display_meta="role")
-            return
-
-        if ctx.kind == "effort_value":
-            for value in iter_effort_value_completions(ctx.prefix, ctx.role):
-                yield Completion(value, start_position=-len(ctx.prefix), display_meta="effort")
-            return
-
-        if ctx.kind == "literal_choice":
-            for choice in iter_literal_choice_completions(ctx.prefix, ctx.choices):
-                yield Completion(choice, start_position=-len(ctx.prefix), display_meta="option")
-            return
-
-        if ctx.kind == "file_path":
-            yield from _iter_file_completions(ctx.prefix, at_mode=ctx.at_mode)
+def input_completions(text):
+    context = completion_for_input(text)
+    if context is None:
+        return
+    if context.kind == "file_path":
+        yield from _iter_file_completions(context.prefix, at_mode=context.at_mode)
+        return
+    choices = {
+        "command": COMMANDS,
+        "agent_role": get_agent_roles(),
+        "literal_choice": context.choices,
+    }
+    if context.kind == "effort_value":
+        values = (
+            ("off", *role_supported_thinking_efforts(context.role))
+            if context.role in get_agent_roles()
+            else EFFORT_VALUES
+        )
+    else:
+        values = choices[context.kind]
+    for value in values:
+        if value.lower().startswith(context.prefix.lower()):
+            yield Completion(
+                value, start_position=-len(context.prefix), display_meta=context.kind
+            )
 
 
 def _resolve_parent(fragment: str) -> tuple[Path, str]:
     path = Path(fragment.replace("\\", "/")).expanduser()
-    parent = path.parent if str(path.parent) not in (".", "") else Path(".")
-    prefix = path.name
-
-    if parent != Path("."):
-        for root in (Path.cwd(), runtime_repo_root()):
-            candidate = (root / parent).resolve()
-            if candidate.is_dir():
-                return candidate, prefix
-        if not parent.is_absolute():
-            resolved = (Path.cwd() / parent).resolve()
-            if resolved.is_dir():
-                return resolved, prefix
-    cwd = Path.cwd()
-    if cwd.is_dir():
-        return cwd, prefix
-    return parent, prefix
+    if not path.is_absolute():
+        path = current_workspace() / path
+    return (
+        (path, "")
+        if fragment.endswith(("/", "\\")) or not fragment
+        else (path.parent, path.name)
+    )
 
 
 def _iter_file_completions(fragment: str, *, at_mode: bool):
-    parent, prefix = _resolve_parent(fragment)
+    opener = fragment[:1] if fragment[:1] in ('"', "'", "{") else ""
+    parent, prefix = _resolve_parent(fragment[1:] if opener else fragment)
     if not parent.exists():
         return
 
     try:
-        children = sorted(parent.iterdir(), key=lambda p: (not p.is_dir(), p.name.lower()))
+        children = sorted(
+            parent.iterdir(), key=lambda p: (not p.is_dir(), p.name.lower())
+        )
     except (PermissionError, OSError):
         return
 
     count = 0
     for child in children:
-        if not child.name.startswith(prefix):
+        name = child.name.casefold() if os.name == "nt" else child.name
+        match = prefix.casefold() if os.name == "nt" else prefix
+        if not name.startswith(match):
             continue
         try:
-            candidate = child.relative_to(Path.cwd()).as_posix()
+            candidate = child.relative_to(current_workspace()).as_posix()
         except ValueError:
             candidate = child.as_posix()
         if child.is_dir():
             candidate += "/"
+        quote = opener or ('"' if any(char.isspace() for char in candidate) else "")
+        if quote:
+            closing = "}" if quote == "{" else quote
+            candidate = quote + candidate + ("" if child.is_dir() else closing)
         display = ("@" if at_mode else "") + candidate
         yield Completion(
             candidate,

@@ -1,195 +1,144 @@
 from __future__ import annotations
 
-import threading
-from concurrent.futures import ThreadPoolExecutor, TimeoutError as FutureTimeoutError
-from typing import TYPE_CHECKING, Any, Callable
+import asyncio
+from functools import wraps
 
-from redlotus.infra import logger
+from redlotus.config.app_config import get_env
+from redlotus.infra.path_sandbox import resolve_readable_path
 
-if TYPE_CHECKING:  # playwright 为可选依赖（extra: browser），仅在实际使用浏览器时才需要
-    from playwright.sync_api import Browser, BrowserContext, Page, Playwright
+
+def page_action(operation):
+    """Serialize page actions and report browser failures to the Agent."""
+
+    @wraps(operation)
+    async def run(self, *args, **kwargs):
+        async with self._lock:
+            try:
+                await self._start()
+                return await operation(self, *args, **kwargs)
+            except (ImportError, RuntimeError) as exc:
+                return f"Error: Browser unavailable: {exc}"
+            except self._browser_error as exc:
+                return f"Error: {operation.__name__}: {exc}"
+
+    return run
 
 
 class PlaywrightBrowserSession:
-    """持久 Chromium 会话；内部仅在单后台线程上触碰 Playwright 对象。"""
+    """A lazy browser owned and closed by the Agent's event loop."""
 
-    def __init__(self) -> None:
-        self._executor = ThreadPoolExecutor(max_workers=1, thread_name_prefix="playwright")
-        self._run_lock = threading.Lock()
-        self._stopped = False
-        self._pw: Playwright | None = None
-        self._browser: Browser | None = None
-        self._context: BrowserContext | None = None
-        self._page: Page | None = None
-        self._headless: bool | None = None
+    def __init__(self, workspace):
+        self.workspace = workspace
+        self._lock = asyncio.Lock()
+        self._playwright = self._browser = self._page = None
+        self._browser_error = ()
 
-
-    def _run(self, fn: Callable[[], Any], timeout: float = 120.0) -> Any:
-        if self._stopped:
-            raise RuntimeError("Playwright session has been shut down")
-        with self._run_lock:
-            future = self._executor.submit(fn)
-            try:
-                return future.result(timeout=timeout)
-            except FutureTimeoutError:
-                self._discard_poisoned_executor()
-                raise
-
-    def _discard_poisoned_executor(self) -> None:
-        poisoned = self._executor
-        self._executor = ThreadPoolExecutor(max_workers=1, thread_name_prefix="playwright")
-        self._pw = None
-        self._browser = None
-        self._context = None
-        self._page = None
-        self._headless = None
-        try:
-            poisoned.shutdown(wait=False, cancel_futures=True)
-        except Exception:
-            pass
-
-    def close(self) -> None:
-        """关闭浏览器（不停止线程池）。从未启动过时直接返回，避免为空操作白白拉起后台线程。"""
-        if self._stopped:
-            return
-        if self._pw is None and self._browser is None and self._context is None and self._page is None:
-            return
-        try:
-            self._run(self._close_impl, timeout=60.0)
-        except Exception as e:
-            logger.warning(f"[browser] close: {e}")
-
-    def shutdown(self) -> None:
-        """关闭浏览器并停止后台线程池（进程退出时调用）。"""
-        if self._stopped:
-            return
-        self.close()
-        self._stopped = True
-        self._executor.shutdown(wait=False, cancel_futures=True)
-
-    def _close_impl(self) -> None:
-        for attr, closer in (
-            ("_page", lambda o: o.close()),
-            ("_context", lambda o: o.close()),
-            ("_browser", lambda o: o.close()),
-        ):
-            obj = getattr(self, attr)
-            if obj is not None:
-                try:
-                    closer(obj)
-                except Exception as e:
-                    logger.warning(f"[browser] 关闭 {attr} 时: {e}")
-
-        if self._pw is not None:
-            try:
-                self._pw.stop()
-            except Exception as e:
-                logger.warning(f"[browser] stop playwright: {e}")
-
-        self._page = None
-        self._context = None
-        self._browser = None
-        self._pw = None
-        self._headless = None
-
-    def _ensure_started_impl(self, headless: bool) -> str | None:
+    async def _start(self):
         if self._page is not None:
-            if self._headless is not None and self._headless != headless:
-                self._close_impl()
-            else:
-                return None
+            return
+        from playwright.async_api import Error, async_playwright
+
+        self._browser_error = Error
+        self._playwright = await async_playwright().start()
         try:
-            try:
-                from playwright.sync_api import sync_playwright
-            except ModuleNotFoundError:
-                return "未安装 playwright；请先 `pip install redlotus[browser]` 再 `playwright install chromium`。"
-            self._pw = sync_playwright().start()
-            self._browser = self._pw.chromium.launch(headless=headless)
-            self._context = self._browser.new_context(
-                viewport={"width": 1280, "height": 720},
-                locale="zh-CN",
+            headless = (get_env("BROWSER_HEADLESS", warn=False) or "").lower() not in (
+                "0",
+                "false",
+                "no",
             )
-            self._page = self._context.new_page()
+            self._browser = await self._playwright.chromium.launch(headless=headless)
+            self._page = await self._browser.new_page(
+                viewport={"width": 1280, "height": 720}, locale="zh-CN"
+            )
             self._page.set_default_timeout(30_000)
-            self._headless = headless
-            return None
-        except Exception as e:
-            self._close_impl()
-            return f"启动浏览器失败: {type(e).__name__}: {e}"
+        except BaseException:
+            await self._close()
+            raise
 
-    def _page_action(
-        self,
-        headless: bool,
-        fn: Callable[[Page], str],
-        error_prefix: str,
+    async def _close(self):
+        try:
+            if self._browser is not None:
+                await self._browser.close()
+        finally:
+            if self._playwright is not None:
+                await self._playwright.stop()
+            self._playwright = self._browser = self._page = None
+
+    async def close(self):
+        async with self._lock:
+            await self._close()
+
+    @page_action
+    async def browser_navigate(
+        self, url: str, wait_until: str = "domcontentloaded"
     ) -> str:
-        def _work() -> str:
-            err = self._ensure_started_impl(headless)
-            if err:
-                return err
-            assert self._page is not None
-            try:
-                return fn(self._page)
-            except Exception as e:
-                return f"{error_prefix}: {type(e).__name__}: {e}"
-        return self._run(_work)
+        """Open a URL in Chromium; wait_until accepts domcontentloaded, load or networkidle.
 
-    def navigate(self, url: str, headless: bool, wait_until: str = "domcontentloaded") -> str:
-        def _action(page: Page) -> str:
-            page.goto(url, wait_until=wait_until, timeout=60_000)
-            msg = f"OK\nURL: {page.url}\nTitle: {page.title()}"
-            if headless:
-                msg += (
-                    "\n\n说明: 当前为无头 Chromium，页面在 Agent 进程内打开，"
-                    "不会出现在您日常使用的 Chrome/Edge 窗口里。"
-                    "若要弹出可見窗口，请设置环境变量 BROWSER_HEADLESS=0（仍为独立浏览器，非系统默认）。"
-                )
-            return msg
-        return self._page_action(headless, _action, "导航失败")
+        Requires playwright and Chromium. Set BROWSER_HEADLESS=0 to show a window.
+        """
+        await self._page.goto(url, wait_until=wait_until, timeout=60_000)
+        return f"OK\nURL: {self._page.url}\nTitle: {await self._page.title()}"
 
-    def get_content(self, headless: bool) -> str:
-        def _action(page: Page) -> str:
-            text = page.evaluate("""() => document.body ? document.body.innerText : ''""")
-            if not isinstance(text, str):
-                text = str(text)
-            text = text.strip()
-            return f"URL: {page.url}\n---\n{text or '(无文本内容)'}"
-        return self._page_action(headless, _action, "读取页面文本失败")
+    @page_action
+    async def browser_get_content(self) -> str:
+        """Read all visible page text, including dynamically rendered content."""
+        text = await self._page.locator("body").inner_text()
+        return f"URL: {self._page.url}\n{text}"
 
-    def screenshot(self, headless: bool, filename: str, full_page: bool = False) -> str:
-        def _action(page: Page) -> str:
-            page.screenshot(path=filename, full_page=full_page)
-            return f"截图已保存: {filename}"
-        return self._page_action(headless, _action, "截图失败")
+    @page_action
+    async def browser_screenshot(self, name: str, full_page: bool = False) -> str:
+        """Save a screenshot to a project path; full_page includes the scrollable page."""
+        path = resolve_readable_path(name, work_base=self.workspace.root)
+        path.parent.mkdir(parents=True, exist_ok=True)
+        await self._page.screenshot(path=str(path), full_page=full_page)
+        return f"Screenshot saved: {path}"
 
-    def click(self, headless: bool, selector: str) -> str:
-        def _action(page: Page) -> str:
-            page.click(selector, timeout=30_000)
-            return f"已点击: {selector}"
-        return self._page_action(headless, _action, "点击失败")
+    @page_action
+    async def browser_click(self, selector: str) -> str:
+        """Click an element using a Playwright CSS or text selector."""
+        await self._page.click(selector)
+        return f"Clicked: {selector}"
 
-    def fill(self, headless: bool, selector: str, text: str) -> str:
-        def _action(page: Page) -> str:
-            page.fill(selector, text, timeout=30_000)
-            return f"已填入 {selector}"
-        return self._page_action(headless, _action, "填充失败")
+    @page_action
+    async def browser_fill(self, selector: str, text: str) -> str:
+        """Replace an input element's text using a Playwright selector."""
+        await self._page.fill(selector, text)
+        return f"Filled: {selector}"
 
-    def press(self, headless: bool, key: str) -> str:
-        def _action(page: Page) -> str:
-            page.keyboard.press(key)
-            return f"已按键: {key}"
-        return self._page_action(headless, _action, "按键失败")
+    @page_action
+    async def browser_press_key(self, key: str) -> str:
+        """Press a Playwright keyboard key, such as Enter, Tab or ArrowDown."""
+        await self._page.keyboard.press(key)
+        return f"Pressed: {key}"
 
-    def wait_for_selector(self, headless: bool, selector: str, timeout_ms: int = 30_000) -> str:
-        timeout_ms = max(1, min(int(timeout_ms), 110_000))
+    @page_action
+    async def browser_wait_for_selector(
+        self, selector: str, timeout_ms: int = 30_000
+    ) -> str:
+        """Wait until an element appears in the page."""
+        await self._page.wait_for_selector(selector, timeout=timeout_ms)
+        return f"Visible: {selector}"
 
-        def _action(page: Page) -> str:
-            page.wait_for_selector(selector, timeout=timeout_ms)
-            return f"已出现元素: {selector}"
-        return self._page_action(headless, _action, "等待元素超时或失败")
+    @page_action
+    async def browser_evaluate(self, javascript_expression: str) -> str:
+        """Evaluate JavaScript in the current page and return its result."""
+        return repr(await self._page.evaluate(javascript_expression))
 
-    def run_javascript(self, headless: bool, expression: str) -> str:
-        def _action(page: Page) -> str:
-            result = page.evaluate(expression)
-            return f"结果: {repr(result)}"
-        return self._page_action(headless, _action, "执行脚本失败")
+    async def browser_close(self) -> str:
+        """Release this browser; the next browser action starts a new session."""
+        await self.close()
+        return "Browser closed"
+
+    @property
+    def tools(self):
+        return [
+            self.browser_navigate,
+            self.browser_get_content,
+            self.browser_screenshot,
+            self.browser_click,
+            self.browser_fill,
+            self.browser_press_key,
+            self.browser_wait_for_selector,
+            self.browser_evaluate,
+            self.browser_close,
+        ]

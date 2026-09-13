@@ -1,9 +1,8 @@
 from __future__ import annotations
 
 import time
+import threading
 from contextlib import contextmanager
-from contextvars import ContextVar
-from dataclasses import dataclass
 from datetime import datetime
 from pathlib import Path
 from typing import Any
@@ -23,46 +22,37 @@ _STYLES = {
     "ERROR": "bold red",
     "CRITICAL": "bold white on red",
 }
-_stm_quiet: ContextVar[int] = ContextVar("stm_quiet", default=0)
-LOG_DIR: Path
+_configured_dir: Path | None = None
+_configuration_lock = threading.Lock()
 _task_sink_id: int | None = None
-SESSION_LOG_MAX_BYTES = 10 * 1024 * 1024   # 单会话日志上限，超出滚动保留一个 .log.1
-LOG_RETENTION_DAYS = 14.0                   # logs 根目录 *.log 保留天数；<=0 关闭清理
+SESSION_LOG_MAX_BYTES = 10 * 1024 * 1024  # 单会话日志上限，超出滚动保留一个 .log.1
+LOG_RETENTION_DAYS = 14.0  # logs 根目录 *.log 保留天数；<=0 关闭清理
 
 
-@dataclass(frozen=True)
-class LoggingConfig:
-    """日志装配参数。default() 把目录锚定到用户数据目录（全局可写）。"""
-
-    log_dir: Path
-    level: str = "DEBUG"
-    console_fmt: str = CONSOLE_FMT
-    file_fmt: str = FILE_FMT
-
-    @classmethod
-    def default(cls) -> "LoggingConfig":
-        return cls(log_dir=logs_dir())
+def get_log_dir() -> Path:
+    return _configured_dir or logs_dir()
 
 
-def configure(cfg: LoggingConfig) -> None:
-    """工厂：清掉 loguru 默认 stderr，挂上控制台 sink + 每会话文件 sink。"""
-    global LOG_DIR, _task_sink_id
-    LOG_DIR = cfg.log_dir
-    _task_sink_id = None
-    cfg.log_dir.mkdir(parents=True, exist_ok=True)
-    _lg.remove()
-    _lg.add(_console_sink, level=cfg.level, format=cfg.console_fmt, filter=_console_filter)
-    _lg.add(_session_sink, level=cfg.level, format=cfg.file_fmt, filter=_session_filter)
-    prune_old_logs()
-
+def ensure_configured() -> None:
+    global _configured_dir
+    with _configuration_lock:
+        if _configured_dir is not None:
+            return
+        _configured_dir = logs_dir()
+        _configured_dir.mkdir(parents=True, exist_ok=True)
+        _lg.remove()
+        _lg.add(
+            _console_sink, level="DEBUG", format=CONSOLE_FMT, filter=_console_filter
+        )
+        _lg.add(_session_sink, level="DEBUG", format=FILE_FMT, filter=_session_filter)
+        prune_old_logs()
 
 
 def _console_filter(record: dict) -> bool:
-    if record["extra"].get("file_only"):
-        return False
-    if _stm_quiet.get() > 0 and record["level"].no < _WARNING_NO:
-        return False
-    return True
+    # Index details stay in the file log; production progress and all failures remain visible.
+    return not record["extra"].get("file_only") and not (
+        record["level"].no < _WARNING_NO and record["message"].startswith("RAG ")
+    )
 
 
 def _console_sink(message: Any) -> None:
@@ -80,7 +70,7 @@ def _session_filter(record: dict) -> bool:
 
 
 def _session_sink(message: Any) -> None:
-    path = LOG_DIR / f"{message.record['extra']['session']}.log"
+    path = get_log_dir() / f"{message.record['extra']['session']}.log"
     path.parent.mkdir(parents=True, exist_ok=True)
     try:
         if path.exists() and path.stat().st_size >= SESSION_LOG_MAX_BYTES:
@@ -93,10 +83,17 @@ def _session_sink(message: Any) -> None:
         f.write(str(message))
 
 
-
-def _emit(level: str, msg: object, args: tuple[Any, ...], *, exc_info: bool = False, file_only: bool = False) -> None:
+def _emit(
+    level: str,
+    msg: object,
+    args: tuple[Any, ...],
+    *,
+    exc_info: bool = False,
+    file_only: bool = False,
+) -> None:
     # loguru 用 {}-style；这里沿用项目的 %-style 先自行格式化，再把成品串原样交给 loguru
     # （不传 args 时 loguru 不会再 .format()，故含 { } / JSON 的文本也安全）。
+    ensure_configured()
     text = (str(msg) % args) if args else str(msg)
     target = _lg.bind(file_only=True) if file_only else _lg
     target.opt(exception=exc_info).log(level, text)
@@ -126,8 +123,11 @@ def info_file_only(msg: object, *args: Any) -> None:
 def setup_task_logger(task_name: str = "task") -> None:
     """为本次任务追加一个文件 sink（重复调用会替换上一个）。"""
     global _task_sink_id
+    ensure_configured()
     ts = datetime.now().strftime("%Y%m%d_%H%M%S")
-    path = LOG_DIR / f"{safe_name(task_name, max_len=50, fallback='task')}_{ts}.log"
+    path = (
+        get_log_dir() / f"{safe_name(task_name, max_len=50, fallback='task')}_{ts}.log"
+    )
     if _task_sink_id is not None:
         _lg.remove(_task_sink_id)
     _task_sink_id = _lg.add(path, level="DEBUG", format=FILE_FMT, encoding="utf-8")
@@ -141,7 +141,9 @@ def prune_old_logs(max_age_days: float | None = None) -> None:
         return
     cutoff = time.time() - days * 86400.0
     try:
-        candidates = list(LOG_DIR.glob("*.log")) + list(LOG_DIR.glob("*.log.1"))
+        candidates = list(get_log_dir().glob("*.log")) + list(
+            get_log_dir().glob("*.log.1")
+        )
     except OSError:
         return
     for p in candidates:
@@ -155,33 +157,7 @@ def prune_old_logs(max_age_days: float | None = None) -> None:
 @contextmanager
 def session_log_context(session_name: str):
     """把本上下文内的日志额外落到 {session}.log。"""
-    with _lg.contextualize(session=safe_name(session_name, max_len=50, fallback="task")):
+    with _lg.contextualize(
+        session=safe_name(session_name, max_len=50, fallback="task")
+    ):
         yield
-
-
-@contextmanager
-def stm_ingest_console_quiet():
-    """短期记忆后台入库时压制控制台 INFO/DEBUG，文件日志不受影响。"""
-    token = _stm_quiet.set(_stm_quiet.get() + 1)
-    try:
-        yield
-    finally:
-        _stm_quiet.reset(token)
-
-
-configure(LoggingConfig.default())
-
-__all__ = [
-    "LOG_DIR",
-    "LoggingConfig",
-    "configure",
-    "debug",
-    "info",
-    "warning",
-    "error",
-    "info_file_only",
-    "setup_task_logger",
-    "prune_old_logs",
-    "session_log_context",
-    "stm_ingest_console_quiet",
-]

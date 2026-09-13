@@ -20,72 +20,28 @@ class ContextUsageItem:
 
 
 class OutputSink(Protocol):
-    @property
-    def supports_model_stream(self) -> bool:
-        ...
+    supports_model_stream: bool
 
-    def emit(self, renderable: Any) -> None:
-        ...
-
-    def rule(self, title: str) -> None:
-        ...
-
-    def set_status(self, message: str) -> None:
-        ...
-
-    def clear_status(self) -> None:
-        ...
-
-    def set_context_usage(self, items: list[ContextUsageItem]) -> None:
-        ...
-
-    def clear_context_usage(self) -> None:
-        ...
-
-    def begin_model_stream(self, title: str) -> None:
-        ...
-
-    def append_model_stream_delta(self, text: str) -> None:
-        ...
-
-    def clear_model_stream(self) -> None:
-        ...
+    def emit(self, renderable: Any) -> None: ...
+    def update(self, action: str, *args) -> None: ...
 
 
 class LegacyOutputSink:
+    supports_model_stream = False
+
     def __init__(self, console: Console) -> None:
         self.console = console
 
-    @property
-    def supports_model_stream(self) -> bool:
-        return False
-
     def emit(self, renderable: Any) -> None:
+        if isinstance(renderable, str) and "\x1b[" in renderable:
+            renderable = Text.from_ansi(renderable)
         self.console.print(renderable)
 
-    def rule(self, title: str) -> None:
-        self.console.rule(title)
-
-    def set_status(self, message: str) -> None:
-        self.console.print(Text(message, style="dim"))
-
-    def clear_status(self) -> None:
-        return
-
-    def set_context_usage(self, items: list[ContextUsageItem]) -> None:
-        return
-
-    def clear_context_usage(self) -> None:
-        return
-
-    def begin_model_stream(self, title: str) -> None:
-        return
-
-    def append_model_stream_delta(self, text: str) -> None:
-        return
-
-    def clear_model_stream(self) -> None:
-        return
+    def update(self, action: str, *args) -> None:
+        if action == "rule":
+            self.console.rule(*args)
+        elif action == "set_status":
+            self.console.print(Text(args[0], style="dim"))
 
 
 _console = Console(highlight=False, legacy_windows=sys.platform == "win32")
@@ -98,10 +54,7 @@ def set_output_sink(sink: OutputSink | None) -> None:
 
 
 def supports_model_stream() -> bool:
-    value = getattr(_sink, "supports_model_stream", False)
-    if callable(value):
-        return bool(value())
-    return bool(value)
+    return _sink.supports_model_stream
 
 
 def emit_renderable(renderable: Any) -> None:
@@ -109,35 +62,35 @@ def emit_renderable(renderable: Any) -> None:
 
 
 def emit_rule(title: str) -> None:
-    _sink.rule(title)
+    _sink.update("rule", title)
 
 
 def set_status(message: str) -> None:
-    _sink.set_status(message)
+    _sink.update("set_status", message)
 
 
 def clear_status() -> None:
-    _sink.clear_status()
+    _sink.update("clear_status")
 
 
 def set_context_usage(items: list[ContextUsageItem]) -> None:
-    _sink.set_context_usage(items)
+    _sink.update("set_context_usage", items)
 
 
 def clear_context_usage() -> None:
-    _sink.clear_context_usage()
+    _sink.update("clear_context_usage")
 
 
 def begin_model_stream(title: str) -> None:
-    _sink.begin_model_stream(title)
+    _sink.update("begin_model_stream", title)
 
 
 def append_model_stream_delta(text: str) -> None:
-    _sink.append_model_stream_delta(text)
+    _sink.update("append_model_stream_delta", text)
 
 
 def clear_model_stream() -> None:
-    _sink.clear_model_stream()
+    _sink.update("clear_model_stream")
 
 
 @contextmanager

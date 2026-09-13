@@ -1,12 +1,17 @@
 from __future__ import annotations
 
 import re
-from collections.abc import Callable, Sequence
-from dataclasses import dataclass
+from collections.abc import Callable
+from dataclasses import dataclass, replace
 from enum import Enum
 from typing import Any
 
-from pydantic_ai.messages import BaseToolReturnPart, ModelRequest, ModelResponse, TextPart
+from pydantic_ai.messages import (
+    BaseToolReturnPart,
+    ModelRequest,
+    ModelResponse,
+    TextPart,
+)
 
 from redlotus.agent_core.input_messages import UserMessage
 from redlotus.prompt import load_prompt
@@ -81,18 +86,14 @@ def build_goal_iteration_prompt(
     original_goal: str,
     iteration: int,
     previous_output: str = "",
-    user_updates: Sequence[str] = (),
     missing_marker_reminder: bool = False,
 ) -> str:
-    updates = "\n".join(
-        f"{index}. {item}" for index, item in enumerate(user_updates, 1)
-    )
     template = load_prompt("goal_iteration.md")
     return template.format(
         original_goal=original_goal.strip(),
         iteration=iteration,
         previous_output=previous_output.strip(),
-        user_updates=updates,
+        user_updates="",
         missing_marker_reminder=str(bool(missing_marker_reminder)).lower(),
     )
 
@@ -104,12 +105,10 @@ async def run_goal_loop(
     history: Any,
     turn_id: str | None,
     conversation_log_hint: str,
-    take_queued_inputs: Callable[[], list[str]],
     set_iteration: Callable[[int], None] | None = None,
 ) -> None:
     original_goal = message.text or ""
     previous_output = ""
-    pending_updates: list[str] = []
     missing_marker = False
     iteration = 0
 
@@ -118,15 +117,12 @@ async def run_goal_loop(
         if set_iteration is not None:
             set_iteration(iteration)
 
-        pending_updates.extend(take_queued_inputs())
         prompt_text = build_goal_iteration_prompt(
             original_goal=original_goal,
             iteration=iteration,
             previous_output=previous_output,
-            user_updates=pending_updates,
             missing_marker_reminder=missing_marker,
         )
-        pending_updates = []
 
         parse_result: GoalParseResult | None = None
 
@@ -135,10 +131,7 @@ async def run_goal_loop(
             parse_result = parse_goal_output(raw_output)
             return parse_result.cleaned_text
 
-        prompt_message = UserMessage(
-            text=prompt_text,
-            attachments=message.attachments if iteration == 1 else [],
-        )
+        prompt_message = replace(message, text=prompt_text)
         _history, output = await system.run_agent_system(
             prompt_message,
             history,
@@ -150,12 +143,12 @@ async def run_goal_loop(
             },
             turn_id=turn_id,
             output_transform=output_transform,
+            _inside_goal=True,
         )
 
         parsed = parse_result or parse_goal_output(output)
         previous_output = summarize_last_coordinator_turn(_history.messages) or output
         missing_marker = parsed.missing_marker
 
-        pending_updates.extend(take_queued_inputs())
-        if parsed.signal == GoalSignal.DONE and not pending_updates:
+        if parsed.signal == GoalSignal.DONE:
             return

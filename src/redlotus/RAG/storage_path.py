@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import os
 import sys
+import hashlib
 from pathlib import Path
 
 from redlotus.infra import logger
@@ -40,7 +41,25 @@ def _is_unsupported_fs(path: Path) -> bool:
     return bool(fs and fs.upper() in _UNSUPPORTED_FS)
 
 
-def resolve_lancedb_dir(configured_path: str) -> str:
+def _fit_windows_path(path: Path, table_name: str) -> str:
+    # Lance adds table, data/index directories and generated filenames. Its Windows
+    # writer currently drops the extended-path prefix before committing a file.
+    if (
+        not table_name
+        or sys.platform != "win32"
+        or len(str(path)) + len(table_name) + 110 < 248
+    ):
+        return str(path)
+    digest = hashlib.sha256(str(path).casefold().encode()).hexdigest()[:16]
+    local_root = Path(os.environ.get("LOCALAPPDATA") or Path.home())
+    fallback = local_root / APP_NAME / "rag_lancedb" / digest
+    logger.info(
+        "LanceDB: 路径过深，向量索引改存 %s；原始记忆与配置保持原位。", fallback
+    )
+    return str(fallback)
+
+
+def resolve_lancedb_dir(configured_path: str, *, table_name: str = "") -> str:
     """将配置的 LanceDB 目录解析为绝对路径；exFAT/FAT 上自动改到 NTFS（RAG_DB_PATH 或 LOCALAPPDATA）。"""
     p = Path(configured_path)
     if not p.is_absolute():
@@ -49,7 +68,7 @@ def resolve_lancedb_dir(configured_path: str) -> str:
         p = p.resolve()
 
     if not _is_unsupported_fs(p):
-        return str(p)
+        return _fit_windows_path(p, table_name)
 
     override = get_env("RAG_DB_PATH", warn=False)
     if override:
@@ -59,21 +78,21 @@ def resolve_lancedb_dir(configured_path: str) -> str:
         else:
             op = op.resolve()
         if not _is_unsupported_fs(op):
-            logger.warning(
+            logger.info(
                 "LanceDB: 配置路径 %s 位于 %s，不支持 Lance 事务；改用 RAG_DB_PATH=%s",
                 p,
                 volume_filesystem(p) or "?",
                 op,
             )
-            return str(op)
+            return _fit_windows_path(op, table_name)
 
     local_root = os.environ.get("LOCALAPPDATA") or str(Path.home())
     fallback = Path(local_root) / APP_NAME / "rag_lancedb" / p.name
-    logger.warning(
+    logger.info(
         "LanceDB: 配置路径 %s 位于 %s（不支持硬链接）；已改用 %s。"
         "可在 config 的 short_term_memory.db_path 或环境变量 RAG_DB_PATH 中指定 NTFS 目录。",
         p,
         volume_filesystem(p) or "?",
         fallback,
     )
-    return str(fallback.resolve())
+    return _fit_windows_path(fallback.resolve(), table_name)

@@ -1,4 +1,5 @@
 """QQ 媒体解析与下载（供 QQ.py 使用，减小主文件体积）。"""
+
 import asyncio
 import os
 import re
@@ -14,6 +15,7 @@ from ncatbot.core import BaseMessageEvent, GroupMessageEvent
 from pydantic_ai import BinaryContent
 
 from redlotus.infra import logger
+from redlotus.ModelGateway.input_policy import ModelInputPolicy
 
 
 def norm_url(url: str) -> str:
@@ -50,7 +52,10 @@ def pick_ct(url: str, header_ct: str, raw: bytes, filename: str = "") -> str:
     ct = (header_ct or "").split(";")[0].strip().lower()
     if ct and ct not in ("application/octet-stream", "binary/octet-stream"):
         return ct
-    for guess in (mimetypes.guess_type(filename or "")[0], mimetypes.guess_type(url or "")[0]):
+    for guess in (
+        mimetypes.guess_type(filename or "")[0],
+        mimetypes.guess_type(url or "")[0],
+    ):
         if guess:
             return guess
     mm = coerce_mm(url, header_ct, raw)
@@ -77,8 +82,14 @@ def _resolve_public_addr(host: str) -> str | None:
             ip = ipaddress.ip_address(addr)
         except ValueError:
             return None
-        if (not ip.is_global or ip.is_private or ip.is_loopback
-                or ip.is_link_local or ip.is_reserved or ip.is_multicast):
+        if (
+            not ip.is_global
+            or ip.is_private
+            or ip.is_loopback
+            or ip.is_link_local
+            or ip.is_reserved
+            or ip.is_multicast
+        ):
             return None
         if chosen is None:
             chosen = addr
@@ -97,7 +108,11 @@ def download_to_binary(url: str, filename: str = "") -> BinaryContent | None:
                 if ip is None:
                     logger.warning(f"[QQ] 拒绝下载非公网媒体地址 {url[:80]}")
                     return None
-                host_header = parsed.host if parsed.port is None else f"{parsed.host}:{parsed.port}"
+                host_header = (
+                    parsed.host
+                    if parsed.port is None
+                    else f"{parsed.host}:{parsed.port}"
+                )
                 resp = client.get(
                     parsed.copy_with(host=ip),
                     headers={"Host": host_header},
@@ -110,7 +125,12 @@ def download_to_binary(url: str, filename: str = "") -> BinaryContent | None:
                 resp.raise_for_status()
                 hc = resp.headers.get("content-type", "").split(";")[0].strip()
                 raw = resp.content
-                return BinaryContent(data=raw, media_type=pick_ct(url, hc, raw, filename=filename))
+                ModelInputPolicy.for_role().check([len(raw)])
+                return BinaryContent(
+                    data=raw,
+                    media_type=pick_ct(url, hc, raw, filename=filename),
+                    identifier=filename or None,
+                )
         logger.warning(f"[QQ] 重定向次数过多 {url[:80]}")
         return None
     except Exception as e:
@@ -122,7 +142,9 @@ def binary_b64(file_val: str) -> BinaryContent | None:
     if not file_val or not file_val.startswith("base64://"):
         return None
     try:
-        return BinaryContent(data=base64.b64decode(file_val[9:]), media_type="image/png")
+        return BinaryContent(
+            data=base64.b64decode(file_val[9:]), media_type="image/png"
+        )
     except Exception as e:
         logger.warning(f"[QQ] 解析 base64 图片失败: {e}")
         return None
@@ -166,12 +188,18 @@ def extract_image_video(event: BaseMessageEvent) -> list[Any]:
     return attachments
 
 
-async def file_id_to_binary(bot_api, event: BaseMessageEvent, file_id: str, filename: str, allow: frozenset[str]) -> BinaryContent | None:
+async def file_id_to_binary(
+    bot_api, event: BaseMessageEvent, file_id: str, filename: str, allow: frozenset[str]
+) -> BinaryContent | None:
     ext = os.path.splitext(filename or "")[1].lower()
     if not file_id or ext not in allow:
         return None
     try:
-        url = await (bot_api.get_group_file_url(event.group_id, file_id) if isinstance(event, GroupMessageEvent) else bot_api.get_private_file_url(file_id))
+        url = await (
+            bot_api.get_group_file_url(event.group_id, file_id)
+            if isinstance(event, GroupMessageEvent)
+            else bot_api.get_private_file_url(file_id)
+        )
     except Exception as e:
         logger.warning(f"[QQ] 获取文件 URL 失败 file_id={file_id[:24]}...: {e}")
         return None
@@ -181,7 +209,9 @@ async def file_id_to_binary(bot_api, event: BaseMessageEvent, file_id: str, file
     return await asyncio.to_thread(download_to_binary, url, filename)
 
 
-async def extract_media(bot_api, event: BaseMessageEvent, allow: frozenset[str]) -> list:
+async def extract_media(
+    bot_api, event: BaseMessageEvent, allow: frozenset[str]
+) -> list:
     attachments = list(await asyncio.to_thread(extract_image_video, event))
     seen: set[str] = set()
 
@@ -196,6 +226,9 @@ async def extract_media(bot_api, event: BaseMessageEvent, allow: frozenset[str])
     for st, sd in iter_segments(event):
         if st == "file":
             await add_fid((sd.get("file_id") or "").strip(), sd.get("file") or "")
-    for m in re.finditer(r"\[CQ:file,file=([^,\]]+),file_id=([^,\]]+)", getattr(event, "raw_message", "") or ""):
+    for m in re.finditer(
+        r"\[CQ:file,file=([^,\]]+),file_id=([^,\]]+)",
+        getattr(event, "raw_message", "") or "",
+    ):
         await add_fid(m.group(2), m.group(1))
     return attachments

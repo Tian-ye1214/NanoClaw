@@ -2,7 +2,7 @@ from __future__ import annotations
 
 import difflib
 import threading
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Callable
 
@@ -63,6 +63,12 @@ class ReviewEntry:
     name: str
     baseline: str
     snapshot: str
+    decisions: dict[int, bool] = field(default_factory=dict)
+    existed: bool = True
+
+    @property
+    def hunks(self):
+        return compute_hunks(self.baseline, self.snapshot)
 
 
 class PendingReviewStore:
@@ -82,18 +88,42 @@ class PendingReviewStore:
             self._on_change = None
             self._entries.clear()
 
-    def register(self, path: Path, *, name: str, baseline: str, snapshot: str) -> None:
-        if baseline == snapshot:
-            return
-        key = str(path)
+    def clear(self) -> None:
+        """Discard the previous project's reviews while retaining the UI subscription."""
         with self._lock:
+            self._entries.clear()
             cb = self._on_change
-            if cb is None:
-                return
-            existing = self._entries.get(key)
-            base = existing.baseline if existing is not None else baseline
-            self._entries[key] = ReviewEntry(Path(path), name, base, snapshot)
         self._notify(cb)
+
+    def _register_locked(self, path, name, baseline, snapshot):
+        if baseline == snapshot or self._on_change is None:
+            return
+        old = self._entries.get(str(path))
+        self._entries[str(path)] = ReviewEntry(
+            path,
+            name,
+            old.baseline if old else baseline or "",
+            snapshot,
+            existed=old.existed if old else baseline is not None,
+        )
+
+    def register(self, path: Path, *, name: str, baseline: str, snapshot: str) -> None:
+        with self._lock:
+            self._register_locked(path, name, baseline, snapshot)
+            callback = self._on_change
+        self._notify(callback)
+
+    def write(self, path: Path, name: str, update):
+        """Publish file contents and their review snapshot as one locked operation."""
+        with self._lock:
+            previous = path.read_text(encoding="utf-8") if path.exists() else None
+            content = update(previous)
+            path.parent.mkdir(parents=True, exist_ok=True)
+            path.write_text(content, encoding="utf-8")
+            self._register_locked(path, name, previous, content)
+            callback = self._on_change
+        self._notify(callback)
+        return previous or "", content
 
     def entries(self) -> list[ReviewEntry]:
         with self._lock:
@@ -103,19 +133,38 @@ class PendingReviewStore:
         with self._lock:
             return self._entries.get(key)
 
-    def apply(self, key: str, rejected: set[int]) -> None:
-        """按当前 rejected 重写文件（幂等）。撤销=该块回退到基线。"""
+    def decide(self, entry: ReviewEntry, index: int, reject: bool) -> bool:
+        """Apply a decision only to the exact version displayed by the UI."""
         with self._lock:
-            entry = self._entries.get(key)
-            if entry is None:
-                return
-            new_text = reconstruct(entry.baseline, entry.snapshot, rejected)
-            try:
-                current = entry.path.read_text(encoding="utf-8") if entry.path.exists() else ""
-            except Exception:
-                current = ""
-            if new_text != current:
-                entry.path.write_text(new_text, encoding="utf-8")
+            if self._entries.get(str(entry.path)) is not entry:
+                return False
+            previous_rejections = {
+                key for key, value in entry.decisions.items() if value
+            }
+            expected = reconstruct(entry.baseline, entry.snapshot, previous_rejections)
+            current = (
+                entry.path.read_text(encoding="utf-8") if entry.path.exists() else ""
+            )
+            if current != expected:
+                raise ValueError(
+                    "文件已在审查界面之外被修改；为保留这些改动，本次决定未应用。"
+                )
+            decisions = {**entry.decisions, index: reject}
+            rejected = {key for key, value in decisions.items() if value}
+            if not entry.existed and len(rejected) == len(entry.hunks):
+                entry.path.unlink(missing_ok=True)
+            else:
+                entry.path.write_text(
+                    reconstruct(entry.baseline, entry.snapshot, rejected),
+                    encoding="utf-8",
+                )
+            entry.decisions = decisions
+        return True
+
+    def finish_decided(self):
+        for entry in self.entries():
+            if all(hunk.index in entry.decisions for hunk in entry.hunks):
+                self.finish(str(entry.path))
 
     def finish(self, key: str) -> None:
         with self._lock:

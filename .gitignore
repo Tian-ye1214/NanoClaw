@@ -19,7 +19,8 @@ data/
 .claude/
 .codegraph/
 .redlotus/*
-tests/*
+.pytest_cache/
+.test-runtime/
 src/redlotus/prompts/LongTermMemory/SOUL.md
 src/redlotus/prompts/LongTermMemory/USER.md
 src/redlotus/prompts/LongTermMemory/consolidation_state.json

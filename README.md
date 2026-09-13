@@ -36,7 +36,7 @@ redlotus
 |---------|-------------|
 | Multi-agent orchestration | The Coordinator selects the execution path. For complex work, the Manager creates dependent tasks and Workers execute them in dependency-aware batches. |
 | Goal mode | RedLotus keeps iterating toward a defined goal until it finishes. Additional user input can be incorporated while the goal is running. |
-| Short- and long-term memory | Short-term memory is stored in LanceDB for semantic retrieval. Long-term memory preserves user preferences and assistant working habits across conversations. |
+| Three memory layers | Append-only traces, LLM perception over 25-turn windows, project-scoped episodes and global long-term RAG. MEMORY.md contains the core profile and reusable experience. |
 | Runtime Skills | `SKILL.md` files provide instructions, references, and scripts on demand. Skill directories are rescanned at the start of each user turn, so newly installed skills do not require a restart. |
 | File and media handling | RedLotus can read images and extract content from PDF, Word, Excel, HTML, Markdown, CSV, JSON, and text files. PDF extraction preserves page text, tables, links, and embedded images. |
 | Review workflow and safeguards | The full-screen TUI includes hunk-by-hunk diff review. Runtime safeguards include path sandboxing, dangerous-command blocking, and child-process cleanup. |
@@ -105,13 +105,9 @@ playwright install chromium
 
 ## Initial configuration
 
-On first launch, RedLotus creates `config.json` in the platform-specific user configuration directory:
+Source checkouts read `src/redlotus/config.json` by default. Model names, sampling and reasoning settings for all four roles come from that file; `/config` shows the selected path.
 
-| Platform | Configuration directory |
-|----------|-------------------------|
-| Windows | `%LOCALAPPDATA%\RedLotus` |
-| Linux | `~/.config/RedLotus` |
-| macOS | `~/Library/Application Support/RedLotus` |
+Set `REDLOTUS_CONFIG_FILE` to select another file, or `REDLOTUS_CONFIG_DIR` to select a directory containing `config.json`. A missing explicitly selected file is initialized from the bundled defaults. Logs, persistent memory and immutable references remain in the user data directory, configurable through `REDLOTUS_DATA_DIR`.
 
 At minimum, configure the model API endpoint and key:
 
@@ -124,7 +120,7 @@ At minimum, configure the model API endpoint and key:
 
 RedLotus accepts OpenAI-compatible APIs. Manager, Worker, Coordinator, and Compressor models can be configured independently. Vector retrieval and reranking use `SILICONFLOW_BASE`, `SILICONFLOW_KEY`, and `RAG_models`.
 
-The same values can be supplied through environment variables or a nearby `.env` file. Do not commit configuration files that contain real API keys.
+Endpoint and credential values can also come from environment variables or `.env` in the user configuration directory or current project. Do not commit configuration files that contain real API keys.
 
 ## Terminal usage
 
@@ -144,7 +140,7 @@ Common shortcuts:
 | `Ctrl+R` | Open the pending-change review |
 | `Ctrl+C` | Stop the current turn |
 | `Ctrl+Q` | Exit |
-| `@path` | Reference a local text file, with Tab completion |
+| `@path` | Reference documents, images or videos, with Tab completion; up to 20 files |
 
 <details>
 <summary>Common slash commands</summary>
@@ -163,6 +159,7 @@ Common shortcuts:
 | `/compress` | Compress Manager and Coordinator context |
 | `/status` · `/trace` · `/tasks` | Inspect lifecycle, invocation traces, and task status |
 | `/stop` · `/cancel` | Stop the current turn or cancel an invocation |
+| `/urgent <text>` | Add a genuine user update to the active tool/model loop; ordinary messages remain FIFO |
 
 </details>
 
@@ -188,9 +185,14 @@ New skills are discovered automatically on subsequent user turns.
 
 ## Files and data
 
-- User-level data: logs, LanceDB short-term memory, and long-term memory are stored in the platform user data directory and remain available across workspaces.
-- Workspace data: conversation snapshots are stored in `.redlotus/`, while Agent artifacts are written to `WorkDatabase/` in the current working directory.
-- Changing directories with `/cd` loads the conversation data associated with that workspace.
+- Session traces are appended to `.redlotus/*.jsonl`; loadable snapshots remain available, and context compression preserves the original trace.
+- Project episodes live in `.redlotus/memory/episodes/`. LanceDB provides project-filtered vector search and reranking, with text fallback when the service is unavailable.
+- Project episodes and global records are stored in LanceDB `memory_records_v3`, isolated by scope and project, and recalled using vector search and reranking. `MEMORY.md` contains the core profile, environment, constraints and general experience, and is read fully each turn without a fixed character cap.
+- File and command tools use the current project. Generated artifacts go to `WorkDatabase/`. `/cd` cancels the old session before switching context.
+
+Ordinary input is consumed as separate FIFO turns. `/urgent` joins the active inner loop together with the completed tool batch. Child Agents use dedicated threads, event loops, and clients, with three active children by default. Finished turns append observations. LLM perception processes 25 turns with a 5-turn overlap, plus short windows at session end. Explicit remember requests are handled immediately; failed production remains pending.
+
+The embedding, reranking, chunking, similarity, candidate-count, and vector-index settings remain configurable. See [architecture, migration, and the RAG parameter mapping](docs/refactor.md) for the parameters replaced by per-turn processing and local semantic edits.
 
 ## QQ and WeChat bots
 
@@ -208,6 +210,8 @@ python -m redlotus.API.WeChat
 ```
 
 QQ integration requires [NapCat](https://github.com/NapNeko/NapCatQQ) with a configured OneBot WebSocket endpoint, bot QQ number, and WebUI token. The WeChat integration prompts for QR-code login at startup.
+
+Personal bot access must be bound in `bot.owner_channels.qq` (private QQ IDs) or `bot.owner_channels.wechat` (wxids). Unbound channels have text-only conversations and no access to personal memory or execution tools. `/stop`, `/clear`, and `/urgent` use the same turn semantics as the terminal. See the [binding example](docs/refactor.md#工作区渠道与迁移).
 
 ## Development
 

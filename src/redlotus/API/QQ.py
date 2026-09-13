@@ -36,13 +36,36 @@ from redlotus.agent_core.input_messages import UserMessage
 from redlotus.API.base import BotBase
 from redlotus.API.qq_media_helpers import extract_media
 
+
 class QQBot(BotBase):
     _ENV_AGENT_TIMEOUT = "QQ_AGENT_TIMEOUT_S"
     _ENV_SEND_TIMEOUT = "QQ_SEND_REPLY_TIMEOUT_S"
-    _FILE_ALLOW_EXT = frozenset({
-        ".png", ".jpg", ".jpeg", ".gif", ".webp", ".bmp", ".mp4", ".mov", ".mkv", ".webm",
-        ".pdf", ".txt", ".md", ".docx", ".xlsx", ".csv", ".json",
-    })
+    _FILE_ALLOW_EXT = frozenset(
+        {
+            ".png",
+            ".jpg",
+            ".jpeg",
+            ".gif",
+            ".webp",
+            ".bmp",
+            ".mp4",
+            ".mov",
+            ".mkv",
+            ".webm",
+            ".pdf",
+            ".txt",
+            ".md",
+            ".docx",
+            ".doc",
+            ".xlsx",
+            ".xls",
+            ".pptx",
+            ".ppt",
+            ".csv",
+            ".json",
+            ".html",
+        }
+    )
 
     def __init__(self):
         super().__init__()
@@ -51,13 +74,8 @@ class QQBot(BotBase):
         self._bot_client = BotClient()
         self._bot_client.add_shutdown_handler(self._on_shutdown)
 
-    @property
-    def platform_tag(self) -> str:
-        return "QQ"
-
-    @property
-    def session_prefix(self) -> str:
-        return "qq_"
+    platform_tag = "QQ"
+    session_prefix = "qq_"
 
     def clean_text(self, raw: str) -> str:
         return re.sub(r"\[CQ:[^\]]+\]", "", raw or "").strip()
@@ -89,15 +107,20 @@ class QQBot(BotBase):
 
     async def _handle_message(self, event: BaseMessageEvent) -> None:
         raw_text = (event.raw_message or "").strip()
-        if not raw_text or (isinstance(event, GroupMessageEvent) and not self._is_at_me(event)):
+        if not raw_text or (
+            isinstance(event, GroupMessageEvent) and not self._is_at_me(event)
+        ):
             return
         session_id = self._session_id(event)
         user_text = self.clean_text(raw_text)
         attachments = await self._extract_attachments(event)
-        user_text, attachments = await self._partition_document_attachments(user_text, attachments)
         await self.dispatch_user_message(
             session_id,
-            UserMessage(text=user_text, attachments=attachments),
+            UserMessage(
+                text=user_text,
+                attachments=attachments,
+                original_text=self.clean_text(raw_text),
+            ),
             partial(self._reply_event, event),
         )
 

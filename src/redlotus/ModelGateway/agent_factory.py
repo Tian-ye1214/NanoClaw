@@ -1,6 +1,5 @@
 from __future__ import annotations
 
-from collections.abc import Mapping, Sequence
 from typing import Any
 
 from pydantic_ai import Agent, FunctionToolset
@@ -11,31 +10,14 @@ from redlotus.config.app_config import get_agent_run_policy
 from redlotus.ModelGateway.model_factory import create_model
 
 
-_WORKER_DEFERRED_CAPABILITIES: dict[str, tuple[str, str]] = {
-    "file_mutation": (
-        "worker_file_mutation",
-        "Use for writing, editing, appending files, or creating directories.",
-    ),
-    "execution": (
-        "worker_execution",
-        "Use for running shell commands or executing files.",
-    ),
-    "browser": (
-        "worker_browser",
-        "Use for browser navigation, screenshots, page interaction, and browser inspection.",
-    ),
-    "media": (
-        "worker_media",
-        "Use for reading images or extracting text from documents and attachments.",
-    ),
-    "memory": (
-        "worker_memory",
-        "Use for querying short-term memory or maintaining long-term memory.",
-    ),
-    "skills": (
-        "worker_skills",
-        "Use for listing, loading, refreshing, or executing Agent Skills.",
-    ),
+_TOOL_DESCRIPTIONS = {
+    "core": "Always-available Worker tools for reading, searching, user input, and coordination.",
+    "file_mutation": "Use for writing, editing, appending files, or creating directories.",
+    "execution": "Use for running shell commands or executing files.",
+    "browser": "Use for browser navigation, screenshots, page interaction, and browser inspection.",
+    "media": "Use for reading images or extracting text from documents and attachments.",
+    "memory": "Use for querying short-term memory or maintaining long-term memory.",
+    "skills": "Use for listing, loading, refreshing, or executing Agent Skills.",
 }
 
 
@@ -57,77 +39,53 @@ def create_function_toolset(
     )
 
 
-def create_deferred_tool_capability(
-    capability_id: str,
-    description: str,
-    tools: Sequence[Any],
-) -> Capability:
-    toolset = create_function_toolset(
-        list(tools),
-        toolset_id=capability_id,
-        instructions=description,
-        defer_loading=True,
-    )
-    return Capability(
-        id=capability_id,
-        description=description,
-        toolsets=[toolset],
-        defer_loading=True,
-    )
-
-
-def create_worker_toolsets_and_capabilities(
-    tool_groups: Mapping[str, Sequence[Any]],
-    *,
-    core_extra_tools: Sequence[Any] = (),
-) -> tuple[list[FunctionToolset], list[Capability]]:
-    core_tools = [
-        *list(tool_groups.get("core", ())),
-        *list(core_extra_tools),
-    ]
-    toolsets = [
-        create_function_toolset(
-            core_tools,
-            toolset_id="worker_core",
-            instructions="Always-available Worker tools for reading, searching, user input, and coordination.",
-        )
-    ] if core_tools else []
-
-    capabilities: list[Capability] = []
-    for group_id, (capability_id, description) in _WORKER_DEFERRED_CAPABILITIES.items():
-        tools_for_group = list(tool_groups.get(group_id, ()))
-        if not tools_for_group:
+def create_worker_toolsets_and_capabilities(tool_groups):
+    """Build resident and deferred tools with the same descriptions, wrapping and IDs."""
+    resident, capabilities = [], []
+    for group, description in _TOOL_DESCRIPTIONS.items():
+        tools = tool_groups.get(group)
+        if not tools:
             continue
-        capabilities.append(
-            create_deferred_tool_capability(
-                capability_id,
-                description,
-                tools_for_group,
-            )
+        identity = "worker_" + group
+        deferred = group != "core"
+        toolset = create_function_toolset(
+            list(tools),
+            toolset_id=identity,
+            instructions=description,
+            defer_loading=deferred,
         )
-    return toolsets, capabilities
+        if deferred:
+            capabilities.append(
+                Capability(
+                    id=identity,
+                    description=description,
+                    toolsets=[toolset],
+                    defer_loading=True,
+                )
+            )
+        else:
+            resident.append(toolset)
+    return resident, capabilities
 
 
 def create_agent(
     model_name: Any,
-    parameter: dict | None,
+    parameter: dict,
     instructions: str | None = None,
     *,
     toolsets: list | None = None,
     capabilities: list | None = None,
+    output_type: Any = str,
 ):
-    if parameter is None:
-        parameter = {
-            "temperature": 1.0,
-            "max_tokens": 32768,
-            "reasoning_effort": False,
-            "thinking": "disabled",
-        }
-
-    model = create_model(model_name, parameter) if isinstance(model_name, str) else model_name
+    model = (
+        create_model(model_name, parameter)
+        if isinstance(model_name, str)
+        else model_name
+    )
 
     return Agent(
         model,
+        output_type=output_type,
         toolsets=list(toolsets) if toolsets is not None else None,
         capabilities=capabilities,
         instructions=instructions or "",

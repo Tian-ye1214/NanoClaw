@@ -24,6 +24,9 @@ dependencies = [
     "pydantic-ai-slim[openai,anthropic,google]==2.0.0",
     "pymupdf>=1.27.2.3",
     "python-docx>=1.2.0",
+    "python-pptx>=1.0.2",
+    "pillow>=12.2.0",
+    "xlrd>=2.0.1",
     "python-dotenv>=1.2.2",
     "pyyaml>=6.0.3",
     "requests>=2.33.1",
@@ -37,7 +40,7 @@ browser = ["playwright>=1.49.0"]
 bots = ["ncatbot>=4.4.1.post1", "wechatbot-sdk>=0.2.1"]
 viz = ["matplotlib>=3.10.9", "reportlab>=4.5.0", "pillow>=12.2.0"]
 build = ["pyinstaller>=6.20.0"]
-dev = ["pytest>=8.0.0", "pytest-asyncio>=0.24.0"]
+dev = ["pytest>=8.0.0", "pytest-asyncio>=0.24.0", "opencv-python-headless>=4.8.0"]
 all = [
     "playwright>=1.49.0",
     "ncatbot>=4.4.1.post1",

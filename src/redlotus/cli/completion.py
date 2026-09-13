@@ -7,42 +7,45 @@ from typing import Literal
 
 from redlotus.config.app_config import (
     THINKING_EFFORTS,
-    get_agent_roles,
-    role_supported_thinking_efforts,
 )
 
-COMMANDS: tuple[str, ...] = (
-    "/help",
-    "/exit",
-    "/quit",
-    "/clear",
-    "/status",
-    "/config",
-    "/usage",
-    "/panel",
-    "/LTM",
-    "/STM",
-    "/pwd",
-    "/cd",
-    "/skills",
-    "/agent",
-    "/effort",
-    "/api",
-    "/compress",
-    "/cancel",
-    "/stop",
-    "/load",
-    "/trace",
-    "/tasks",
-)
+COMMAND_HELP = {
+    "/help": "显示本帮助",
+    "/exit": "退出程序（也接受 quit、exit、退出）",
+    "/quit": "退出程序",
+    "/clear": "清空上下文并开启新对话（也接受“新任务”，旧快照保留）",
+    "/status": "查看 Agent 生命周期与调用状态",
+    "/config": "查看配置摘要",
+    "/context": "查看上下文 token 用量分解与压缩阈值",
+    "/usage": "查看用量与计费统计，可指定日志路径",
+    "/panel": "查看工作区运行和历史总览；--all 显示全部会话",
+    "/LTM": "show / clear / retry：查看、清空或重试全局长期记忆",
+    "/STM": "show / clear / retry：查看、清空或重试当前项目情景记忆",
+    "/pwd": "查看当前项目目录",
+    "/cd": "/cd <path>：切换项目并加载该项目对话",
+    "/skills": "查看已加载 Skills",
+    "/agent": "/agent <role> <模型名>：查看或切换角色模型",
+    "/effort": "/effort <role> off 或支持的级别：查看或设置思考",
+    "/api": "查看配置对话；/api embedding 配置 embedding/rerank 接口",
+    "/compress": "压缩 Manager / Coordinator 上下文",
+    "/cancel": "/cancel <invocation_id> 或 /cancel agent <agent_id>：取消调用",
+    "/stop": "停止当前任务，保留会话",
+    "/urgent": "/urgent <内容>：加入当前回合，工具继续执行，下一次模型请求统一处理",
+    "/load": "选择并加载当前项目对话快照",
+    "/trace": "/trace <turn_id>：查看追踪记录",
+    "/tasks": "查看任务状态与依赖",
+}
+COMMANDS = tuple(COMMAND_HELP)
 
 EFFORT_VALUES: tuple[str, ...] = ("off", *THINKING_EFFORTS)
 
-CompletionKind = Literal["command", "agent_role", "effort_value", "literal_choice", "file_path"]
+CompletionKind = Literal[
+    "command", "agent_role", "effort_value", "literal_choice", "file_path"
+]
 
 _SUBCOMMAND_CHOICES: dict[str, tuple[str, ...]] = {
-    "/ltm": ("show", "clear"),
-    "/stm": ("show", "clear"),
+    "/ltm": ("show", "clear", "retry"),
+    "/stm": ("show", "clear", "retry"),
     "/cancel": ("agent",),
     "/api": ("embedding",),
 }
@@ -65,9 +68,8 @@ def completion_for_input(text: str) -> InputCompletion | None:
         return InputCompletion(kind="command", prefix=text)
 
     if text.startswith("/agent "):
-        parts = text.split()
-        prefix = parts[-1] if len(parts) > 1 else ""
-        if len(parts) == 2:
+        prefix = text[len("/agent ") :]
+        if " " not in prefix:
             return InputCompletion(kind="agent_role", prefix=prefix)
         return None
 
@@ -77,7 +79,9 @@ def completion_for_input(text: str) -> InputCompletion | None:
             return InputCompletion(kind="agent_role", prefix=rest)
         role, prefix = rest.split(" ", 1)
         if " " not in prefix.strip():
-            return InputCompletion(kind="effort_value", prefix=prefix, role=role.lower())
+            return InputCompletion(
+                kind="effort_value", prefix=prefix, role=role.lower()
+            )
         return None
 
     if text.startswith("/cd "):
@@ -86,49 +90,29 @@ def completion_for_input(text: str) -> InputCompletion | None:
 
     for cmd, choices in _SUBCOMMAND_CHOICES.items():
         if text.lower().startswith(cmd + " "):
-            parts = text.split()
-            prefix = parts[-1] if len(parts) > 1 else ""
-            if len(parts) == 2:
-                return InputCompletion(kind="literal_choice", prefix=prefix, choices=choices)
+            prefix = text[len(cmd) + 1 :]
+            if " " not in prefix:
+                return InputCompletion(
+                    kind="literal_choice", prefix=prefix, choices=choices
+                )
             return None
 
     at_index = text.rfind("@")
     if at_index != -1:
+        if (
+            at_index
+            and text[at_index - 1].isascii()
+            and (text[at_index - 1].isalnum() or text[at_index - 1] in "._%+-")
+        ):
+            return None
         fragment = text[at_index + 1 :]
-        if " " in fragment:
+        if fragment[:1] in ('"', "'", "{"):
+            closing = "}" if fragment[0] == "{" else fragment[0]
+            if closing in fragment[1:]:
+                return None
+            return InputCompletion(kind="file_path", prefix=fragment, at_mode=True)
+        if any(char.isspace() for char in fragment):
             return None
         return InputCompletion(kind="file_path", prefix=fragment, at_mode=True)
 
     return None
-
-
-def iter_command_completions(prefix: str):
-    """Yield command strings matching *prefix*."""
-    folded = prefix.lower()
-    for cmd in COMMANDS:
-        if cmd.lower().startswith(folded):
-            yield cmd
-
-
-def iter_agent_role_completions(prefix: str):
-    """Yield agent role names matching *prefix*."""
-    for role in get_agent_roles():
-        if role.startswith(prefix):
-            yield role
-
-
-def iter_effort_value_completions(prefix: str, role: str = ""):
-    """Yield thinking on/off + effort-level values matching *prefix*."""
-    folded = prefix.lower()
-    values = ("off", *role_supported_thinking_efforts(role)) if role in get_agent_roles() else EFFORT_VALUES
-    for value in values:
-        if value.startswith(folded):
-            yield value
-
-
-def iter_literal_choice_completions(prefix: str, choices: tuple[str, ...]):
-    """Yield fixed subcommand choices (e.g. show/clear) matching *prefix*."""
-    folded = prefix.lower()
-    for choice in choices:
-        if choice.startswith(folded):
-            yield choice

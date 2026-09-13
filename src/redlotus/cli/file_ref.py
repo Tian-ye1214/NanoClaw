@@ -1,129 +1,33 @@
-"""@文件 引用解析与读取。"""
+"""Parse only the original user input, then build immutable typed references."""
 
 from __future__ import annotations
 
+import asyncio
+import os
+import re
 import unicodedata
-from dataclasses import dataclass
 from pathlib import Path
 
-from redlotus.infra.path_sandbox import runtime_repo_root
-
-_BINARY_SUFFIXES = frozenset(
-    {
-        ".png", ".jpg", ".jpeg", ".gif", ".webp", ".bmp", ".ico",
-        ".mp4", ".avi", ".mov", ".mkv", ".webm",
-        ".pdf", ".exe", ".zip", ".tar", ".gz", ".7z", ".rar",
-        ".dll", ".so", ".dylib", ".bin", ".pyc", ".woff", ".woff2",
-    }
-)
-_TEXT_SUFFIXES = frozenset(
-    {
-        ".py", ".md", ".txt", ".json", ".yaml", ".yml", ".toml",
-        ".js", ".ts", ".tsx", ".jsx", ".java", ".go", ".rs",
-        ".cpp", ".c", ".h", ".hpp", ".cs", ".rb", ".php",
-        ".html", ".css", ".scss", ".sql", ".sh", ".bat", ".ps1",
-        ".xml", ".csv", ".ini", ".cfg", ".env", ".log",
-    }
-)
-
-
-@dataclass(frozen=True)
-class FileRefResult:
-    path: str
-    ok: bool
-    error: str | None = None
-    content: str | None = None
-    truncated: bool = False
-    resolved: Path | None = None
-
-
-@dataclass(frozen=True)
-class _ParsedFileRef:
-    path: str
-    locked: bool = False
-
-
-def _parse_file_refs(text: str) -> list[_ParsedFileRef]:
-    text = text or ""
-    refs: list[_ParsedFileRef] = []
-    index = 0
-    length = len(text)
-
-    while index < length:
-        at_index = text.find("@", index)
-        if at_index == -1:
-            break
-        start = at_index + 1
-        if start >= length:
-            break
-
-        marker = text[start]
-        if marker.isspace():
-            index = start + 1
-            continue
-
-        if marker == "{":
-            end = text.find("}", start + 1)
-            if end == -1:
-                index = start + 1
-                continue
-            ref = text[start + 1 : end].strip()
-            if ref:
-                refs.append(_ParsedFileRef(ref, locked=True))
-            index = end + 1
-            continue
-
-        if marker in ("\"", "'"):
-            end = text.find(marker, start + 1)
-            if end == -1:
-                index = start + 1
-                continue
-            ref = text[start + 1 : end].strip()
-            if ref:
-                refs.append(_ParsedFileRef(ref, locked=True))
-            index = end + 1
-            continue
-
-        end = start
-        while end < length and not text[end].isspace():
-            end += 1
-        ref = text[start:end]
-        if ref:
-            refs.append(_ParsedFileRef(ref))
-        index = end
-
-    return refs
+from redlotus.workspace.workspace import current_workspace
+from redlotus.runtime.context import WorkspaceContext
+from redlotus.ModelGateway.input_policy import ModelInputPolicy
+from redlotus.references.models import ReferenceFile
+from redlotus.references.store import ReferenceStore
 
 
 def _resolve_ref_path(ref: str) -> Path:
-    p = Path(ref).expanduser()
-    if p.is_absolute():
-        return p.resolve()
-    cwd = Path.cwd()
-    candidate = (cwd / ref).resolve()
-    if candidate.exists():
-        return candidate
-    repo = runtime_repo_root()
-    repo_candidate = (repo / ref).resolve()
-    if repo_candidate.exists():
-        return repo_candidate
-    return candidate
+    return (current_workspace() / Path(ref).expanduser()).resolve()
 
 
 def _looks_like_inline_text_suffix(suffix: str) -> bool:
-    if not suffix:
-        return False
-    first = suffix[0]
-    if first in ".-_/\\":
-        return False
-    codepoint = ord(first)
-    if (
-        0x4E00 <= codepoint <= 0x9FFF
-        or 0x3040 <= codepoint <= 0x30FF
-        or 0xAC00 <= codepoint <= 0xD7AF
-    ):
-        return True
-    return unicodedata.category(first).startswith("P")
+    return bool(
+        suffix
+        and suffix[0] not in ".-_/\\"
+        and (
+            re.match(r"[\u4e00-\u9fff\u3040-\u30ff\uac00-\ud7af]", suffix)
+            or unicodedata.category(suffix[0]).startswith("P")
+        )
+    )
 
 
 def _resolve_existing_ref_prefix(ref: str) -> tuple[str, Path] | None:
@@ -141,98 +45,75 @@ def _resolve_existing_ref_prefix(ref: str) -> tuple[str, Path] | None:
     return None
 
 
-def _read_text_safely(path: Path) -> str:
-    for encoding in ("utf-8", "gbk"):
-        try:
-            return path.read_text(encoding=encoding)
-        except UnicodeDecodeError:
-            continue
-    raise ValueError("无法识别文件编码")
+def parse_file_paths(text: str) -> list[Path]:
+    token = re.compile(
+        r"(?<![A-Za-z0-9._%+-])@(?:\{([^}]+)\}|\"([^\"]+)\"|'([^']+)'|([^\s]+))"
+    )
+    candidates = []
+    for match in token.finditer(text):
+        value = next(v for v in match.groups() if v is not None).strip()
+        path = _resolve_ref_path(value)
+        if not path.exists() and match.group(4):
+            recovered = _resolve_existing_ref_prefix(value)
+            if recovered:
+                _, path = recovered
+        candidates.append(path)
+    media = {
+        ".png",
+        ".jpg",
+        ".jpeg",
+        ".webp",
+        ".gif",
+        ".bmp",
+        ".mp4",
+        ".mov",
+        ".mkv",
+        ".avi",
+        ".webm",
+    }
+    for match in re.finditer(r'"([^"\n]+)"|\'([^\'\n]+)\'|(\S+)', token.sub(" ", text)):
+        value = next(v for v in match.groups() if v is not None)
+        if Path(value).suffix.lower() in media:
+            path = _resolve_ref_path(value)
+            if path.is_file():
+                candidates.append(path)
+    unique = {}
+    for path in candidates:
+        unique.setdefault(os.path.normcase(str(path)), path)
+    return list(unique.values())
 
 
-def load_file_refs(
-    text: str,
-    *,
-    max_chars: int = 20_000,
-    total_max_chars: int = 50_000,
-) -> list[FileRefResult]:
-    refs = _parse_file_refs(text)
-    if not refs:
-        return []
-
-    results: list[FileRefResult] = []
-    total_used = 0
-    seen: set[str] = set()
-
-    for parsed_ref in refs:
-        ref = parsed_ref.path
-        if ref in seen:
+async def load_file_refs(
+    text: str, *, role: str = "coordinator"
+) -> list[ReferenceFile]:
+    paths = parse_file_paths(text)
+    policy = ModelInputPolicy.for_role(role)
+    if len(paths) > policy.max_files:
+        raise ValueError(
+            f"最多引用 {policy.max_files} 个文件，本次引用 {len(paths)} 个。"
+        )
+    errors, sizes = [], []
+    for path in paths:
+        if not path.is_file():
+            errors.append(f"{path}: 文件不存在或不是普通文件")
             continue
-        seen.add(ref)
-
-        try:
-            path = _resolve_ref_path(ref)
-        except (OSError, RuntimeError, ValueError) as e:
-            results.append(FileRefResult(path=ref, ok=False, error=str(e)))
-            continue
-        if not path.exists() and not parsed_ref.locked:
-            recovered = _resolve_existing_ref_prefix(ref)
-            if recovered is not None:
-                ref, path = recovered
-        if not path.exists():
-            results.append(FileRefResult(path=ref, ok=False, error="文件不存在"))
-            continue
-        if path.is_dir():
-            results.append(FileRefResult(path=ref, ok=False, error="暂不支持直接引用目录"))
-            continue
-
-        suffix = path.suffix.lower()
-        if suffix in _BINARY_SUFFIXES:
-            results.append(FileRefResult(path=ref, ok=False, error="不支持引用二进制文件"))
-            continue
-        try:
-            content = _read_text_safely(path)
-        except PermissionError:
-            results.append(FileRefResult(path=ref, ok=False, error="无权限读取文件"))
-            continue
-        except (OSError, ValueError) as e:
-            results.append(FileRefResult(path=ref, ok=False, error=str(e)))
-            continue
-
-        truncated = False
-        budget = min(max_chars, total_max_chars - total_used)
-        if budget <= 0:
-            results.append(FileRefResult(path=ref, ok=False, error="文件引用总字符数已达上限"))
-            continue
-        if len(content) > budget:
-            content = content[:budget]
-            truncated = True
-        total_used += len(content)
-
-        results.append(
-            FileRefResult(
-                path=str(path),
-                ok=True,
-                content=content,
-                truncated=truncated,
-                resolved=path,
+        size = path.stat().st_size
+        sizes.append(size)
+        if size > policy.max_file_bytes:
+            errors.append(
+                f"{path}: {size:,} 字节，超过单文件限额 {policy.max_file_bytes:,} 字节"
             )
-        )
-    return results
+    if errors:
+        raise ValueError("引用文件失败：\n" + "\n".join(errors))
+    policy.check(sizes)
+    store = ReferenceStore(WorkspaceContext.from_path(current_workspace()))
+    slots = asyncio.Semaphore(4)
 
+    async def read(path):
+        async with slots:
+            try:
+                return await store.import_file(path, policy=policy)
+            except Exception as exc:
+                raise ValueError(f"引用文件 {path.name} 解析失败：{exc}") from exc
 
-def augment_text_with_file_refs(text: str, refs: list[FileRefResult]) -> str:
-    """将成功读取的文件内容附加到用户输入后，供 Agent 使用。"""
-    ok_refs = [r for r in refs if r.ok and r.content is not None]
-    if not ok_refs:
-        return text
-
-    blocks = [text]
-    for item in ok_refs:
-        suffix = ""
-        if item.truncated:
-            suffix = "\n（内容已截断）"
-        blocks.append(
-            f"引用文件：{item.path}{suffix}\n\n```\n{item.content}\n```"
-        )
-    return "\n\n".join(blocks)
+    return list(await asyncio.gather(*(read(path) for path in paths)))

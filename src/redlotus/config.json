@@ -9,35 +9,35 @@
   },
   "models": {
     "manager": {
-      "name": "deepseek-v4-pro",
+      "name": "deepseek-flash",
       "temperature": 1.0,
       "max_tokens": 131072,
       "top_p": 1.0,
-      "reasoning_effort": "xhigh",
+      "reasoning_effort": "max",
       "thinking": "enabled"
     },
     "worker": {
-      "name": "deepseek-v4-flash",
+      "name": "deepseek-flash",
       "temperature": 1.0,
       "max_tokens": 131072,
       "top_p": 1.0,
-      "reasoning_effort": "high",
+      "reasoning_effort": "max",
       "thinking": "enabled"
     },
     "coordinator": {
-      "name": "deepseek-v4-pro",
+      "name": "deepseek-flash",
       "temperature": 1.0,
       "max_tokens": 131072,
       "top_p": 1.0,
-      "reasoning_effort": "xhigh",
+      "reasoning_effort": "max",
       "thinking": "enabled"
     },
     "compressor": {
-      "name": "deepseek-v4-pro",
+      "name": "deepseek-flash",
       "temperature": 0.2,
       "max_tokens": 4096,
       "top_p": 1.0,
-      "reasoning_effort": "xhigh",
+      "reasoning_effort": "max",
       "thinking": "enabled"
     }
   },
@@ -69,7 +69,11 @@
     }
   },
   "bot": {
-    "session_queue_maxsize": 50
+    "session_queue_maxsize": 50,
+    "owner_channels": {
+      "qq": [],
+      "wechat": []
+    }
   },
   "conversation_log": {
     "save_model_thinking_chain": true
@@ -84,32 +88,26 @@
     "final_top_k": 8,
     "use_rerank": true,
     "min_similarity": 0.3,
-    "reconcile_on_query": true,
     "turn_token_limit": 8192,
     "turn_chunk_overlap_tokens": 512,
     "index": {
       "min_rows": 256,
       "metric": "cosine",
       "rebuild_every_n_adds": 100
-    },
-    "soft_forget": {
-      "enabled": true,
-      "max_age_days": 30,
-      "grace_until_first_use": true
     }
   },
   "long_term_memory": {
-    "consolidation": {
-      "max_transcript_chars": 28000,
-      "max_output_tokens": 4096,
-      "log_read_chunk_bytes": 72000,
-      "merge_min_similarity": 0.35,
-      "merge_max_len_ratio": 2.6,
-      "merge_min_len_ratio": 0.35,
-      "merge_len_check_min_old_chars": 200,
-      "debounce": { "min_new_turns": 3, "min_interval_sec": 120 }
-    }
+    "table_name": "semantic_memories"
   },
   "request_limit": null,
-  "MODEL_HTTP_TIMEOUT": 300
+  "MODEL_HTTP_TIMEOUT": 300,
+  "memory_perception": {
+    "window_turns": 25,
+    "overlap_turns": 5
+  },
+  "input_limits": {
+    "defaults": {
+      "max_file_bytes": 20000000
+    }
+  }
 }

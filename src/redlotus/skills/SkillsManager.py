@@ -1,252 +1,188 @@
-# -*- coding: utf-8 -*-
+from __future__ import annotations
+
 import re
+import shlex
+import subprocess
+import sys
 import threading
-import yaml
-from pathlib import Path
-from typing import Dict, List, Optional, Tuple
 from dataclasses import dataclass, field
+from pathlib import Path
+
+import yaml
 
 from redlotus.infra import logger
 from redlotus.infra.paths import skills_dir as shipped_skills_dir, user_skills_dir
-
-
-@dataclass
-class SkillMetadata:
-    name: str
-    description: str
-    path: Path
-
-    def to_summary(self) -> str:
-        return f"- **{self.name}**: {self.description}"
+from redlotus.infra.subprocess_runner import run_subprocess
 
 
 @dataclass
 class Skill:
-    metadata: SkillMetadata
-    instructions: str = ""
-    resources: Dict[str, str] = field(default_factory=dict)
-
-    @property
-    def description(self) -> str:
-        return self.metadata.description
-
-    @property
-    def path(self) -> Path:
-        return self.metadata.path
+    name: str
+    description: str
+    path: Path
+    instructions: str
+    resources: dict[str, str] = field(default_factory=dict)
 
 
 class SkillsManager:
-    """
-    Skills 管理器：仅支持 skills/<目录名>/SKILL.md；增删改查与显式 refresh。
-    """
+    """Discover bundled/installed Skills and expose their read/execute operations."""
 
-    FRONTMATTER_PATTERN = re.compile(
-        r"^---\s*\n(.*?)\n---\s*\n",
-        re.DOTALL,
-    )
-    SKILL_FILENAME = "SKILL.md"
+    FRONTMATTER_PATTERN = re.compile(r"^---\s*\n(.*?)\n---\s*\n", re.DOTALL)
     IGNORED_RESOURCE_DIRS = {".git", "__pycache__", ".idea", ".vscode"}
 
     def __init__(self, skills_dir: str | Path | None = None):
-        # skills_dir = 可写 overlay（运行时新装技能的落点，也是暴露给 agent 的安装目录）
-        if skills_dir is None:
-            skills_dir = user_skills_dir()
-        self.skills_dir = Path(skills_dir)
-        # 扫描顺序：随包基线 → overlay；同名时 overlay 覆盖基线
-        self._roots: list[Path] = [Path(shipped_skills_dir()), self.skills_dir]
-        self.skills: Dict[str, Skill] = {}
-
-        self._refresh_lock = threading.Lock()
-
-        self._discover_skills()
-
-    def _parse_skill_file(self, skill_path: Path) -> Optional[Tuple[SkillMetadata, str]]:
-        try:
-            content = skill_path.read_text(encoding="utf-8")
-        except Exception as e:
-            logger.warning(f"无法读取 Skill 文件 {skill_path}: {e}")
-            return None
-
-        match = self.FRONTMATTER_PATTERN.match(content)
-        if not match:
-            logger.warning(f"Skill 文件 {skill_path} 缺少 YAML 前置元数据")
-            return None
-
-        try:
-            frontmatter = yaml.safe_load(match.group(1))
-        except yaml.YAMLError as e:
-            logger.warning(f"Skill 文件 {skill_path} YAML 解析失败: {e}")
-            return None
-
-        if not isinstance(frontmatter, dict):
-            logger.warning(f"Skill 文件 {skill_path} YAML 格式无效")
-            return None
-
-        name = str(frontmatter.get("name", ""))
-        description = str(frontmatter.get("description", ""))
-
-        instructions = content[match.end() :].strip()
-        metadata = SkillMetadata(
-            name=name,
-            description=description,
-            path=skill_path.parent,
+        self.skills_dir = (
+            Path(skills_dir) if skills_dir is not None else user_skills_dir()
         )
-        return metadata, instructions
+        self._roots = (shipped_skills_dir(), self.skills_dir)
+        self._refresh_lock = threading.Lock()
+        self.skills = {}
+        self.refresh()
+
+    def _read_skill(self, path):
+        content = path.read_text(encoding="utf-8")
+        match = self.FRONTMATTER_PATTERN.match(content)
+        if match is None:
+            raise ValueError("Missing YAML front matter")
+        meta = yaml.safe_load(match[1])
+        if not isinstance(meta, dict):
+            raise ValueError("Skill metadata must be a YAML mapping")
+        name = str(meta.get("name") or path.parent.name)
+        return Skill(
+            name,
+            str(meta.get("description", "")),
+            path.parent,
+            content[match.end() :].strip(),
+        )
 
     def refresh(self) -> None:
-        fresh: Dict[str, Skill] = {}
         with self._refresh_lock:
-            self._discover_skills(into=fresh)
+            fresh = {}
+            # Only the writable overlay is created; its entries override bundled Skills.
+            self.skills_dir.mkdir(parents=True, exist_ok=True)
+            for root in self._roots:
+                for path in root.glob("*/SKILL.md"):
+                    try:
+                        skill = self._read_skill(path)
+                        fresh[skill.name] = skill
+                    except (OSError, ValueError, yaml.YAMLError) as exc:
+                        logger.warning("无法加载 Skill %s: %s", path, exc)
             self.skills = fresh
 
-    def _discover_skills(self, into: Dict[str, Skill] | None = None) -> None:
-        target = self.skills if into is None else into
-        if into is not None:
-            into.clear()
-        # 仅在可写 overlay 上建目录；随包基线目录只读，不可 mkdir
-        try:
-            self.skills_dir.mkdir(parents=True, exist_ok=True)
-        except OSError as e:
-            logger.warning(f"无法创建技能 overlay 目录 {self.skills_dir}: {e}")
-
-        for root in self._roots:
-            if not root.is_dir():
-                continue
-            for item in root.iterdir():
-                if not item.is_dir():
-                    continue
-                skill_file = item / self.SKILL_FILENAME
-                if not skill_file.is_file():
-                    continue
-                result = self._parse_skill_file(skill_file)
-                if result:
-                    metadata, instructions = result
-                    if not metadata.name:
-                        logger.warning(
-                            f"Skill {skill_file} 缺少 name，回退使用文件夹名 '{item.name}'"
-                        )
-                        metadata.name = item.name
-                    target[metadata.name] = Skill(
-                        metadata=metadata,
-                        instructions=instructions,
-                    )
-
-    def get_skill(self, name: str) -> Optional[Skill]:
-        return self.skills.get(name)
-
-    def get_all_metadata(self) -> List[SkillMetadata]:
-        return [self.skills[n].metadata for n in sorted(self.skills)]
+    def get_all_metadata(self) -> list[Skill]:
+        return [self.skills[name] for name in sorted(self.skills)]
 
     def get_skills_summary(self) -> str:
-        if not self.skills:
-            return "当前没有可用的 Skills。"
+        rows = [
+            f"- **{skill.name}**: {skill.description}"
+            for skill in self.get_all_metadata()
+        ]
+        return "\n".join(
+            [
+                "## 可用的 Agent Skills",
+                *rows,
+                "使用 get_skill_instructions(skill_name) 获取详细指令。",
+            ]
+        )
 
-        lines = ["## 可用的 Agent Skills", ""]
-        for metadata in self.get_all_metadata():
-            lines.append(metadata.to_summary())
-        lines.append("")
-        lines.append("使用 `get_skill_instructions(skill_name)` 获取具体 Skill 的详细指令。")
-        return "\n".join(lines)
+    def list_available_skills(self) -> str:
+        """List available Skills, descriptions and absolute resource directories."""
+        return (
+            "\n".join(
+                f"{s.name}: {s.description} ({s.path})" for s in self.get_all_metadata()
+            )
+            or "当前没有可用的 Skills。"
+        )
 
-    def load_skill_instructions(self, name: str) -> Optional[str]:
-        skill = self.skills.get(name)
-        if not skill:
-            return None
-        logger.info(f"加载 Skill 指令: {name}")
-        return skill.instructions
-
-    def load_skill_resource(self, skill_name: str, resource_name: str) -> Optional[str]:
+    def get_skill_instructions(self, skill_name: str) -> str:
+        """Read a Skill's complete instructions before using it; also lists optional resources."""
         skill = self.skills.get(skill_name)
-        if not skill:
-            return None
+        if skill is None:
+            return f"Error: Skill '{skill_name}' not found. Available: {', '.join(self.skills)}"
+        resources = self.list_skill_resources(skill_name)
+        return (
+            f"# Skill: {skill.name}\n{skill.description}\n\n{skill.instructions}\n\n资源：\n"
+            + "\n".join(resources)
+        )
 
-        if resource_name in skill.resources:
-            return skill.resources[resource_name]
-
-        resource_path = self._resolve_within(skill.path, resource_name)
-        if resource_path is None or not resource_path.exists():
-            logger.warning(f"Skill {skill_name} 的资源 {resource_name} 不存在或越界")
-            return None
-
-        try:
-            content = resource_path.read_text(encoding="utf-8")
-            skill.resources[resource_name] = content
-            logger.info(f"加载 Skill 资源: {skill_name}/{resource_name}")
-            return content
-        except Exception as e:
-            logger.warning(f"无法读取 Skill 资源 {resource_path}: {e}")
-            return None
-
-    def list_skill_resources(self, skill_name: str) -> List[str]:
+    def list_skill_resources(self, skill_name: str) -> list[str]:
         skill = self.skills.get(skill_name)
-        if not skill:
+        if skill is None:
             return []
+        return [
+            str(path.relative_to(skill.path))
+            for path in skill.path.rglob("*")
+            if path.is_file()
+            and path.name != "SKILL.md"
+            and not self.IGNORED_RESOURCE_DIRS.intersection(
+                path.relative_to(skill.path).parts
+            )
+        ]
 
-        resources = []
-        skill_dir = skill.path
-        for item in skill_dir.rglob("*"):
-            if not item.is_file() or item.name == self.SKILL_FILENAME:
-                continue
-            rel_path = item.relative_to(skill_dir)
-            if any(part in self.IGNORED_RESOURCE_DIRS for part in rel_path.parts):
-                continue
-            resources.append(str(rel_path))
-        return resources
+    def _resource_path(self, skill_name, resource_name):
+        root = self.skills[skill_name].path.resolve()
+        path = (root / resource_name).resolve()
+        if not path.is_relative_to(root):
+            raise ValueError("Resource must remain inside the Skill directory")
+        return path
 
-    @staticmethod
-    def _resolve_within(skill_dir: Path, relative: str) -> Optional[Path]:
-        """把 relative 解析到 skill_dir 内；绝对路径或 .. 逃逸出目录则返回 None。"""
-        base = skill_dir.resolve()
+    def load_skill_resource(self, skill_name: str, resource_name: str) -> str:
+        """Read a Skill resource on demand, including guides, templates and script sources."""
         try:
-            target = (base / relative).resolve()
-        except Exception:
-            return None
-        return target if target.is_relative_to(base) else None
+            skill = self.skills[skill_name]
+            if resource_name not in skill.resources:
+                path = self._resource_path(skill_name, resource_name)
+                skill.resources[resource_name] = path.read_text(encoding="utf-8")
+            return f"# 资源: {skill_name}/{resource_name}\n\n{skill.resources[resource_name]}"
+        except (KeyError, OSError, ValueError) as exc:
+            return f"Error loading Skill resource: {exc}"
+
+    def refresh_skills(self) -> str:
+        """Rescan installed and bundled Skills after adding or changing a Skill."""
+        self.refresh()
+        return f"Skills 已刷新。当前共有 {len(self.skills)} 个 Skills 可用。"
 
     async def execute_skill_script(
         self, skill_name: str, script_name: str, args: str = "", timeout: float = 300
     ) -> str:
-        import sys
-        import subprocess
-        from redlotus.infra.subprocess_runner import run_subprocess
+        """Run a script inside its Skill directory without adding its source to context.
 
-        skill = self.skills.get(skill_name)
-        if not skill:
-            return f"错误: Skill '{skill_name}' 不存在"
-
-        script_path = self._resolve_within(skill.path, script_name)
-        if script_path is None:
-            return f"错误: 脚本路径越界: '{script_name}'"
-        if not script_path.exists():
-            return f"错误: 脚本 '{script_name}' 不存在"
-
-        ext = script_path.suffix.lower()
-        py_exec = "python" if getattr(sys, "frozen", False) else sys.executable
+        Supports Python, Bash, batch and PowerShell. Quote arguments containing spaces.
+        Python uses the running application's interpreter; timeout also reaps child processes.
+        """
         executors = {
-            ".py": [py_exec],
+            ".py": ["python" if getattr(sys, "frozen", False) else sys.executable],
             ".sh": ["bash"],
             ".bat": ["cmd", "/c"],
             ".ps1": ["powershell", "-File"],
         }
-
-        if ext not in executors:
-            return f"错误: 不支持的脚本类型 '{ext}'"
-
-        cmd = executors[ext] + [str(script_path)]
-        if args:
-            cmd.extend(args.split())
-
         try:
-            stdout, stderr, return_code = await run_subprocess(
-                cmd, shell=False, cwd=str(skill.path), timeout=timeout
+            script = self._resource_path(skill_name, script_name)
+            if not script.is_file():
+                raise FileNotFoundError(script_name)
+            command = [
+                *executors[script.suffix.lower()],
+                str(script),
+                *shlex.split(args),
+            ]
+            stdout, stderr, code = await run_subprocess(
+                command,
+                shell=False,
+                cwd=str(self.skills[skill_name].path),
+                timeout=timeout,
             )
-            output = stdout + stderr
-            return (
-                f"返回码: {return_code}\n输出:\n{output}"
-                if output
-                else f"执行完成，返回码: {return_code}"
-            )
+            return f"返回码: {code}\n输出:\n{stdout}{stderr}"
         except subprocess.TimeoutExpired:
-            return f"错误: 脚本执行超时 ({timeout}秒)"
-        except Exception as e:
-            return f"执行错误: {e}"
+            return f"Error: Skill script timed out ({timeout} seconds)"
+        except (KeyError, OSError, ValueError) as exc:
+            return f"Error executing Skill script: {exc}"
+
+    @property
+    def tools(self):
+        return [
+            self.list_available_skills,
+            self.get_skill_instructions,
+            self.load_skill_resource,
+            self.refresh_skills,
+            self.execute_skill_script,
+        ]

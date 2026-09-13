@@ -37,7 +37,7 @@ redlotus
 |------|------|
 | 多 Agent 编排 | Coordinator 判断处理路径；复杂任务由 Manager 构建带依赖的任务列表，Worker 按依赖分批执行并汇总结果。 |
 | 目标模式 | 给定一个明确目标后持续迭代，直到任务完成；执行期间仍可接收用户补充信息。 |
-| 长短期记忆 | 短期记忆写入 LanceDB 并支持语义召回；长期记忆保存用户偏好与助手工作习惯，可跨会话使用。 |
+| 三层记忆 | 会话原始轨迹、25 回合窗口的 LLM 情景感知、全局长期 RAG，以及每轮注入的用户画像与通用经验。 |
 | 运行时 Skills | 通过 `SKILL.md` 按需加载指令、参考资料和脚本；技能目录会在用户回合开始时重新扫描，无需重启。 |
 | 文件与多媒体处理 | 可读取图片，并提取 PDF、Word、Excel、HTML、Markdown、CSV、JSON 和文本文件中的内容。PDF 支持按页提取正文、表格、链接与内嵌图片。 |
 | 终端审查与安全护栏 | 提供全屏 TUI、逐块 diff 审查、路径沙箱、危险命令拦截和子进程回收。 |
@@ -106,13 +106,9 @@ playwright install chromium
 
 ## 首次配置
 
-首次启动会在用户配置目录生成 `config.json`：
+源码运行默认读取 `src/redlotus/config.json`。四个角色的模型名称、采样与推理参数均从这一文件读取；`/config` 显示当前实际路径。
 
-| 系统 | 配置目录 |
-|------|----------|
-| Windows | `%LOCALAPPDATA%\RedLotus` |
-| Linux | `~/.config/RedLotus` |
-| macOS | `~/Library/Application Support/RedLotus` |
+可用 `REDLOTUS_CONFIG_FILE` 指定另一份配置，或用 `REDLOTUS_CONFIG_DIR` 指定包含 `config.json` 的目录。显式指定的文件不存在时，会复制随包默认配置。日志、长期记忆和引用原件仍放在用户数据目录，可用 `REDLOTUS_DATA_DIR` 指定独立位置。
 
 至少需要配置模型服务地址和密钥：
 
@@ -125,7 +121,7 @@ playwright install chromium
 
 RedLotus 接受 OpenAI 兼容接口。Manager、Worker、Coordinator 和 Compressor 可以分别配置模型。短期记忆的向量检索与重排使用 `SILICONFLOW_BASE`、`SILICONFLOW_KEY` 和 `RAG_models` 配置。
 
-也可以通过环境变量或当前目录附近的 `.env` 提供同名配置。不要将包含真实密钥的配置文件提交到 Git。
+服务地址和凭据也可以通过环境变量、用户配置目录或当前项目的 `.env` 提供。不要将包含真实密钥的配置文件提交到 Git。
 
 ## 终端使用
 
@@ -145,7 +141,7 @@ RedLotus 接受 OpenAI 兼容接口。Manager、Worker、Coordinator 和 Compres
 | `Ctrl+R` | 打开逐块改动审查 |
 | `Ctrl+C` | 停止当前回合 |
 | `Ctrl+Q` | 退出 |
-| `@路径` | 引用本地文本文件，支持 Tab 补全 |
+| `@路径` | 引用文档、图片或视频，支持 Tab 补全；每次最多 20 个文件 |
 
 <details>
 <summary>常用斜杠命令</summary>
@@ -164,6 +160,7 @@ RedLotus 接受 OpenAI 兼容接口。Manager、Worker、Coordinator 和 Compres
 | `/compress` | 压缩 Manager / Coordinator 上下文 |
 | `/status` · `/trace` · `/tasks` | 查看生命周期、调用追踪和任务状态 |
 | `/stop` · `/cancel` | 中断当前回合或 invocation |
+| `/urgent <内容>` | 加入当前内循环，与工具结果一起处理；普通消息仍逐条排队 |
 
 </details>
 
@@ -189,9 +186,14 @@ npx clawhub --dir skills install <slug>
 
 ## 文件与数据位置
 
-- 用户级数据：日志、LanceDB 短期记忆和长期记忆保存在系统用户数据目录，可跨工作区使用。
-- 工作区数据：会话快照保存在当前目录的 `.redlotus/`，Agent 工作产物保存在 `WorkDatabase/`。
-- 使用 `/cd` 切换目录时，会加载对应工作区的会话数据。
+- 会话轨迹追加保存在 `.redlotus/*.jsonl`，兼容快照继续可加载；压缩只改变模型视图，完整原文保留。
+- 项目情景保存在 `.redlotus/memory/episodes/`，LanceDB 按项目进行向量检索和重排；服务不可用时提供项目内文本检索。
+- 项目情景与全局长期记录保存在 LanceDB `memory_records_v3`，按 scope 和项目隔离，通过向量检索与重排召回。`MEMORY.md` 只保存用户画像、环境、行为约束与通用经验，每回合完整读取，不设固定字符上限。
+- 文件和命令工具默认操作当前项目，生成产物保存在 `WorkDatabase/`。`/cd` 先取消旧会话，再切换运行上下文。
+
+普通输入逐条 FIFO 消费，`/urgent` 与当前工具批次结果合并进入后续模型请求。子 Agent 各自拥有线程、事件循环和客户端，默认最多同时运行 3 个。每个结束的回合只追加原始事件；默认 25 回合、5 回合重叠后由 LLM 聚合，收尾时补处理短窗口。主动记忆通过 remember 即时处理，失败和取消不会自动成为成功经验。
+
+向量模型、重排、分块、相似度阈值、候选数量和索引参数继续保留。完整的保留项、替代项与迁移行为见 [重构及 RAG 参数说明](docs/refactor.md)。
 
 ## QQ 与微信机器人
 
@@ -209,6 +211,8 @@ python -m redlotus.API.WeChat
 ```
 
 QQ 接入需要先运行 [NapCat](https://github.com/NapNeko/NapCatQQ)，并配置 OneBot WebSocket、机器人 QQ 号和 WebUI token。微信接入在启动后按提示扫码登录。
+
+个人聊天渠道需要配置 `bot.owner_channels.qq`（本人私聊 QQ 号）或 `bot.owner_channels.wechat`（本人 wxid）。未绑定渠道提供文本对话，不开放个人记忆和执行工具。`/stop`、`/clear`、`/urgent` 与终端使用同一回合语义。配置示例见 [渠道绑定](docs/refactor.md#工作区渠道与迁移)。
 
 ## 本地开发
 

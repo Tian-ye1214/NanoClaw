@@ -2,106 +2,27 @@ from __future__ import annotations
 
 import asyncio
 import json
+import copy
+import hashlib
 import threading
-import weakref
-from collections.abc import Callable
-from dataclasses import dataclass
 from datetime import datetime
 from pathlib import Path
 from typing import Any
 
 from pydantic_ai.messages import ModelMessagesTypeAdapter
 
-from redlotus.config.app_config import settings
-from redlotus.infra.persist_utils import atomic_write_json, file_lock, iso_utc_now, safe_segment
-from redlotus.infra import logger
+from redlotus.infra.persist_utils import (
+    atomic_write_json,
+    file_lock,
+    iso_utc_now,
+    safe_segment,
+)
 from redlotus.workspace.workspace import (
     MODEL_MESSAGES_SUFFIX,
     conversations_root,
     snapshot_base_from_loadable,
     snapshot_basename,
 )
-
-_SAVE_BATCH_DELAY_SECONDS = 0.2
-
-
-@dataclass(frozen=True)
-class _SavePayload:
-    model_path: Path
-    write: Callable[[], None]
-
-
-class ConversationLogWriter:
-    def __init__(self, *, batch_delay: float = _SAVE_BATCH_DELAY_SECONDS) -> None:
-        self._batch_delay = batch_delay
-        self._queue: asyncio.Queue[_SavePayload] = asyncio.Queue()
-        self._pending: dict[Path, _SavePayload] = {}
-        self._task: asyncio.Task[None] | None = None
-        self._idle = asyncio.Event()
-        self._idle.set()
-
-    def enqueue(self, payload: _SavePayload) -> None:
-        self._idle.clear()
-        self._queue.put_nowait(payload)
-        if self._task is None or self._task.done():
-            self._task = asyncio.create_task(self._run(), name="conversation-log-writer")
-
-    async def drain(self, timeout: float) -> bool:
-        if self._task is None:
-            return True
-        try:
-            await asyncio.wait_for(self._idle.wait(), timeout=timeout)
-            return True
-        except asyncio.TimeoutError:
-            logger.warning("conversation_log drain timed out after %.1fs", timeout)
-            return False
-
-    async def _run(self) -> None:
-        while True:
-            payload = await self._queue.get()
-            self._pending[payload.model_path] = payload
-            self._queue.task_done()
-            await self._collect_batch()
-            await self._flush_pending()
-            if self._queue.empty() and not self._pending:
-                self._idle.set()
-
-    async def _collect_batch(self) -> None:
-        loop = asyncio.get_running_loop()
-        deadline = loop.time() + self._batch_delay
-        while True:
-            remaining = deadline - loop.time()
-            if remaining <= 0:
-                return
-            try:
-                payload = await asyncio.wait_for(self._queue.get(), timeout=remaining)
-            except asyncio.TimeoutError:
-                return
-            self._pending[payload.model_path] = payload
-            self._queue.task_done()
-
-    async def _flush_pending(self) -> None:
-        batch = self._pending
-        self._pending = {}
-        for payload in batch.values():
-            try:
-                await asyncio.to_thread(payload.write)
-            except Exception as e:
-                logger.error("conversation_log 写入失败: %s", e)
-
-
-_WRITERS: weakref.WeakKeyDictionary[asyncio.AbstractEventLoop, ConversationLogWriter] = weakref.WeakKeyDictionary()
-_WRITERS_LOCK = threading.Lock()
-
-
-def _writer_for_running_loop() -> ConversationLogWriter:
-    loop = asyncio.get_running_loop()
-    with _WRITERS_LOCK:
-        writer = _WRITERS.get(loop)
-        if writer is None:
-            writer = ConversationLogWriter()
-            _WRITERS[loop] = writer
-        return writer
 
 
 def read_saved_model_messages_file(path: Path) -> tuple[list[Any], dict[str, Any]]:
@@ -115,28 +36,13 @@ def read_saved_model_messages_file(path: Path) -> tuple[list[Any], dict[str, Any
         raise ValueError("文件格式无效：缺少 model_messages 数组")
     meta_raw = data.get("meta")
     meta: dict[str, Any] = dict(meta_raw) if isinstance(meta_raw, dict) else {}
+    meta["saved_at"] = data.get("saved_at")
     messages = ModelMessagesTypeAdapter.validate_python(raw)
     return messages, meta
 
 
-def dump_validated_model_messages(model_messages: list[Any]) -> list[dict[str, Any]]:
-    raw = ModelMessagesTypeAdapter.dump_python(model_messages, mode="json")
-    ModelMessagesTypeAdapter.validate_python(raw)
-    return raw
-
-
-async def drain_pending_saves(timeout: float = 10.0) -> bool:
-    try:
-        writer = _WRITERS.get(asyncio.get_running_loop())
-    except RuntimeError:
-        return True
-    if writer is None:
-        return True
-    return await writer.drain(timeout)
-
-
 class ConversationLog:
-    """对话落盘。save() 写入工作区 .redlotus 下两份文件：可读 .json 与 *_ModelMessages.json。"""
+    """Append original events to JSONL and save the separate loadable model-context view."""
 
     def __init__(
         self,
@@ -146,27 +52,29 @@ class ConversationLog:
         *,
         sub_id: str | None = None,
         existing_run_base: Path | None = None,
+        workspace=None,
     ) -> None:
         self._name = safe_segment(name, 40)
         self._date = safe_segment(date or "", 16)
         self._topic = safe_segment(topic or "", 80)
         self._sub_id = safe_segment(sub_id, 60) if sub_id else None
-        self._root = conversations_root()
+        self._root = (
+            workspace.root / ".redlotus"
+            if workspace is not None
+            else conversations_root()
+        )
         self._run_base: Path | None = existing_run_base
         self._init_lock = threading.Lock()
-
-    def _snapshot_paths(self, base: Path) -> tuple[Path, Path]:
-        return (
-            base.parent / f"{base.name}.json",
-            base.parent / f"{base.name}{MODEL_MESSAGES_SUFFIX}",
-        )
+        self._journal_seen: set[str] | None = None
 
     def model_messages_path(self) -> Path | None:
         if self._run_base is None:
             return None
-        return self._snapshot_paths(self._run_base)[1]
+        return self._run_base.with_name(self._run_base.name + MODEL_MESSAGES_SUFFIX)
 
-    def save(self, model_messages: list[Any], *, extra: dict[str, Any] | None = None) -> None:
+    async def save(
+        self, model_messages: list[Any], *, extra: dict[str, Any] | None = None
+    ) -> None:
         """模型返回后调用；异步落盘，不阻塞事件循环。同一会话多次调用覆盖同一对文件。"""
         with self._init_lock:
             if self._run_base is None:
@@ -183,24 +91,74 @@ class ConversationLog:
         base = self._run_base
         if base is None:
             return
-        snap = list(model_messages)
+        snap = copy.deepcopy(model_messages)
 
+        write = asyncio.create_task(
+            asyncio.to_thread(self._write, base, snap, dict(extra) if extra else None)
+        )
         try:
-            extra_snapshot = dict(extra) if extra else None
-            _, model_path = self._snapshot_paths(base)
-            _writer_for_running_loop().enqueue(
-                _SavePayload(
-                    model_path=model_path,
-                    write=lambda: self._write(base, snap, extra_snapshot),
-                )
-            )
-        except RuntimeError:
-            pass
+            await asyncio.shield(write)
+        except asyncio.CancelledError:
+            await write
+            raise
 
-    def _write(self, base: Path, model_messages: list[Any], extra: dict[str, Any] | None) -> None:
-        raw = dump_validated_model_messages(model_messages)
+    def _append_journal(self, base: Path, raw: list[dict], meta: dict) -> None:
+        """Keep every original message version, even when the model view is compacted."""
+        path = base.with_name(base.name + ".jsonl")
+        with file_lock(path):
+            if self._journal_seen is None:
+                self._journal_seen = set()
+                if path.exists():
+                    for line in path.read_text(encoding="utf-8").splitlines():
+                        try:
+                            self._journal_seen.add(
+                                self._message_id(json.loads(line)["message"])
+                            )
+                        except (ValueError, KeyError):
+                            continue
+            entries = []
+            new_ids = set()
+            for message in raw:
+                digest = self._message_id(message)
+                if digest not in self._journal_seen and digest not in new_ids:
+                    origin = (message.get("metadata") or {}).get("origin")
+                    entries.append(
+                        json.dumps(
+                            dict(
+                                event_id=digest,
+                                saved_at=iso_utc_now(),
+                                meta={**meta, **({"origin": origin} if origin else {})},
+                                message=message,
+                            ),
+                            ensure_ascii=False,
+                        )
+                    )
+                    new_ids.add(digest)
+            if entries:
+                with path.open("a", encoding="utf-8") as stream:
+                    stream.write("\n".join(entries) + "\n")
+                    stream.flush()
+                self._journal_seen.update(new_ids)
+
+    @staticmethod
+    def _message_id(message: dict) -> str:
+        # The SDK attaches request/run metadata after submission. That is not a new message.
+        identity = dict(kind=message["kind"], parts=message["parts"])
+        if message["kind"] == "response":
+            identity["timestamp"] = message.get("timestamp")
+        encoded = json.dumps(identity, ensure_ascii=False, sort_keys=True)
+        return hashlib.sha256(encoded.encode("utf-8")).hexdigest()
+
+    def _write(
+        self, base: Path, model_messages: list[Any], extra: dict[str, Any] | None
+    ) -> None:
+        raw = ModelMessagesTypeAdapter.dump_python(model_messages, mode="json")
         saved_at = iso_utc_now()
-        meta: dict[str, Any] = {"agent": self._name, "date": self._date, "topic": self._topic}
+        meta: dict[str, Any] = {
+            "agent": self._name,
+            "date": self._date,
+            "topic": self._topic,
+        }
         if self._sub_id:
             if self._name == "worker":
                 meta["sub_id"] = self._sub_id
@@ -208,80 +166,14 @@ class ConversationLog:
                 meta["session_id"] = self._sub_id
         if extra:
             meta.update(extra)
-        readable_path, model_path = self._snapshot_paths(base)
-        readable_path.parent.mkdir(parents=True, exist_ok=True)
-        with file_lock(readable_path):
-            atomic_write_json(
-                readable_path,
-                {"saved_at": saved_at, "meta": meta, "messages": self._to_readable(raw)},
-            )
+        model_path = self.model_messages_path()
+        model_path.parent.mkdir(parents=True, exist_ok=True)
+        self._append_journal(base, raw, meta)
         with file_lock(model_path):
             atomic_write_json(
                 model_path,
                 {"saved_at": saved_at, "meta": meta, "model_messages": raw},
             )
-
-    def _to_readable(self, raw: list[dict[str, Any]]) -> list[dict[str, Any]]:
-        messages: list[dict[str, Any]] = []
-        include_thinking = self._save_model_thinking_chain_enabled()
-        for msg in raw:
-            parts = msg.get("parts") or []
-            if msg.get("kind") == "request":
-                for p in parts:
-                    if p.get("part_kind") == "user-prompt":
-                        messages.append({"role": "user", "content": self._str_content(p.get("content"))})
-                    elif p.get("part_kind") == "tool-return":
-                        messages.append({"role": "tool", "name": p.get("tool_name"), "tool_call_id": p.get("tool_call_id"), "content": p.get("content")})
-            elif msg.get("kind") == "response":
-                texts = [p.get("content") or "" for p in parts if p.get("part_kind") == "text"]
-                thinking_parts = [
-                    p.get("content") or ""
-                    for p in parts
-                    if p.get("part_kind") in ("thinking", "reasoning", "reasoning-content")
-                ]
-                tool_calls = [{"id": p.get("tool_call_id"), "name": p.get("tool_name"), "arguments": p.get("args")} for p in parts if p.get("part_kind") == "tool-call"]
-                entry: dict[str, Any] = {"role": "assistant"}
-                if text := "\n".join(t for t in texts if t).strip():
-                    entry["content"] = text
-                if include_thinking:
-                    reasoning_content = msg.get("reasoning_content")
-                    chains: list[str] = []
-                    if isinstance(reasoning_content, str) and reasoning_content.strip():
-                        chains.append(reasoning_content.strip())
-                    chains.extend(t.strip() for t in thinking_parts if isinstance(t, str) and t.strip())
-                    if chains:
-                        entry["thinking_chain"] = "\n\n".join(chains)
-                if tool_calls:
-                    entry["tool_calls"] = tool_calls
-                if len(entry) > 1:
-                    messages.append(entry)
-        return messages
-
-    def _save_model_thinking_chain_enabled(self) -> bool:
-        raw = settings().get("conversation_log")
-        if not isinstance(raw, dict):
-            return False
-        flag = raw.get("save_model_thinking_chain")
-        if isinstance(flag, bool):
-            return flag
-        if isinstance(flag, str):
-            return flag.strip().lower() in ("1", "true", "yes", "on")
-        return bool(flag)
-
-    def _str_content(self, content: Any) -> str:
-        if isinstance(content, str):
-            return content
-        if isinstance(content, list):
-            chunks = []
-            for item in content:
-                if isinstance(item, str):
-                    chunks.append(item)
-                elif isinstance(item, dict) and item.get("kind") == "binary":
-                    chunks.append(f"<binary {item.get('media_type', '?')} base64_len={len(item.get('data', ''))}>")
-                else:
-                    chunks.append(str(item))
-            return "\n".join(chunks)
-        return str(content)
 
 
 class SessionConversationLogs:
@@ -323,7 +215,9 @@ class SessionConversationLogs:
         if self._on_reset:
             self._on_reset()
 
-    def bind_loaded_snapshot(self, agent_name: str, load_path: Path, meta: dict[str, Any]) -> None:
+    def bind_loaded_snapshot(
+        self, agent_name: str, load_path: Path, meta: dict[str, Any]
+    ) -> None:
         """将会话日志绑定到 /load 的原始快照文件，后续保存继续覆盖该文件。"""
         p = Path(load_path)
         base = snapshot_base_from_loadable(p)
@@ -333,9 +227,10 @@ class SessionConversationLogs:
             date = safe_segment(datetime.now().strftime("%Y%m%d"), 16)
         if not topic:
             topic = safe_segment(base.name, 80)
+        if (self._date, self._topic) != (date, topic):
+            self._logs.clear()
         self._date = date
         self._topic = topic
-        self._logs.clear()
         key = safe_segment(agent_name, 40)
         instance_raw = meta.get("session_id") or meta.get("sub_id")
         instance_id = safe_segment(str(instance_raw), 60) if instance_raw else None

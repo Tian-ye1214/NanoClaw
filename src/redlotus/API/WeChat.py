@@ -1,13 +1,13 @@
 import asyncio
-import base64
 from functools import partial
 
-from pydantic_ai import BinaryContent, ImageUrl
+from pydantic_ai import BinaryContent
 from wechatbot import WeChatBot
 
 from redlotus.infra import logger
 from redlotus.agent_core.input_messages import UserMessage
 from redlotus.API.base import BotBase
+
 
 class WeChatAgentBot(BotBase):
     _ENV_AGENT_TIMEOUT = "WECHAT_AGENT_TIMEOUT_S"
@@ -19,13 +19,8 @@ class WeChatAgentBot(BotBase):
         "file": "application/octet-stream",
     }
 
-    @property
-    def platform_tag(self) -> str:
-        return "WeChat"
-
-    @property
-    def session_prefix(self) -> str:
-        return "wx_"
+    platform_tag = "WeChat"
+    session_prefix = "wx_"
 
     async def _build_user_message(self, bot: WeChatBot, msg) -> UserMessage:
         """Build a UserMessage from text plus downloaded media bytes."""
@@ -40,19 +35,16 @@ class WeChatAgentBot(BotBase):
             filename = getattr(media, "file_name", None) or ""
             mtype = (getattr(media, "type", None) or "").lower()
             mime = self.guess_download_mime(filename=filename, media_type_key=mtype)
-            if mtype == "image":
-                b64 = base64.standard_b64encode(media.data).decode("ascii")
-                attachments.append(ImageUrl(url=f"data:{mime};base64,{b64}"))
-            else:
-                text, consumed = await self._inline_document_bytes(
-                    text,
-                    media.data,
-                    media_type=mime,
-                    filename=filename or None,
+            attachments.append(
+                BinaryContent(
+                    data=media.data, media_type=mime, identifier=filename or None
                 )
-                if not consumed:
-                    attachments.append(BinaryContent(data=media.data, media_type=mime))
-        return UserMessage(text=text, attachments=attachments)
+            )
+        return UserMessage(
+            text=text,
+            attachments=attachments,
+            original_text=self.clean_text(msg.text or ""),
+        )
 
     async def _handle_message(self, bot: WeChatBot, msg) -> None:
         if not msg.user_id:
